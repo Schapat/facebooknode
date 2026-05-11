@@ -9,13 +9,12 @@ Diese Anleitung beschreibt Schritt für Schritt, wie du den Facebook Automation 
 1. [Voraussetzungen](#1-voraussetzungen)
 2. [Repository vorbereiten](#2-repository-vorbereiten)
 3. [Facebook Automation Service in Coolify deployen](#3-facebook-automation-service-in-coolify-deployen)
-4. [n8n in Coolify deployen](#4-n8n-in-coolify-deployen)
-5. [n8n Community Node installieren](#5-n8n-community-node-installieren)
-6. [n8n Credentials einrichten](#6-n8n-credentials-einrichten)
-7. [Facebook Cookies exportieren](#7-facebook-cookies-exportieren)
-8. [Ersten Workflow erstellen](#8-ersten-workflow-erstellen)
-9. [Netzwerk & Sicherheit](#9-netzwerk--sicherheit)
-10. [Troubleshooting](#10-troubleshooting)
+4. [n8n mit Facebook Automation Node in Coolify deployen](#4-n8n-mit-facebook-automation-node-in-coolify-deployen)
+5. [n8n Credentials einrichten](#5-n8n-credentials-einrichten)
+6. [Facebook Cookies exportieren](#6-facebook-cookies-exportieren)
+7. [Ersten Workflow erstellen](#7-ersten-workflow-erstellen)
+8. [Netzwerk & Sicherheit](#8-netzwerk--sicherheit)
+9. [Troubleshooting](#9-troubleshooting)
 
 ---
 
@@ -168,149 +167,64 @@ Coolify kann bei jedem Git-Push automatisch redeployen:
 
 ---
 
-## 4. n8n in Coolify deployen
+## 4. n8n mit Facebook Automation Node in Coolify deployen
 
-Falls du noch keine n8n-Instanz hast, deploye n8n ebenfalls über Coolify.
+Das fertige Compose File liegt im Repository unter [`n8n-compose.yml`](n8n-compose.yml). Es enthält einen **Init-Container**, der den Facebook Automation Node automatisch aus dem GitHub-Repo baut und per Shared Volume in n8n einbindet.
 
-### Methode A: Docker Image (Standard-n8n)
+### So funktioniert es
 
-1. **Neue Ressource hinzufügen**
-   - Im selben Projekt → **+ New Resource** → **Docker Image**
-   - Image: `docker.n8n.io/n8nio/n8n`
-   - Tag: `latest`
+```
+n8n-node-installer (init)          n8n / n8n-worker
+─────────────────────────          ─────────────────
+1. Klont github.com/Schapat/       3. Starten nach dem Installer
+   facebooknode                    4. Laden den Node über
+2. Baut shared-types + n8n-node       N8N_CUSTOM_EXTENSIONS
+   → kopiert nach /output            aus dem Shared Volume
+         │                                  ▲
+         └──── n8n-custom-nodes Volume ─────┘
+```
 
-2. **Port setzen**
-   - Container Port: `5678`
+### Neuen n8n Service Stack anlegen
 
-3. **Persistent Storage**
-   - **Storages** → **+ Add**
-   - Volume-Name: `n8n_data`
-   - Mount Path: `/home/node/.n8n`
+1. Coolify Dashboard → **Projects** → dein Projekt (oder neues Projekt erstellen)
+2. **+ New Resource** → **Service** → wähle **n8n (with PostgreSQL and Workers)**
+3. Coolify erstellt automatisch einen Service Stack mit n8n, Worker, PostgreSQL, Redis und Task Runners
 
-4. **Environment Variables**
+### Compose File anpassen
 
-   | Variable | Wert |
-   |----------|------|
-   | `N8N_HOST` | `n8n.deine-domain.de` |
-   | `N8N_PORT` | `5678` |
-   | `N8N_PROTOCOL` | `https` |
-   | `WEBHOOK_URL` | `https://n8n.deine-domain.de/` |
-   | `N8N_SECURE_COOKIE` | `true` |
-   | `GENERIC_TIMEZONE` | `Europe/Berlin` |
+1. Klicke auf den erstellten Service Stack → **Edit Compose File**
+2. **Ersetze den gesamten Inhalt** mit dem Inhalt aus [`n8n-compose.yml`](n8n-compose.yml) im Repository
+3. Klicke **Save**
 
-5. **Domain zuweisen**
-   - z.B. `n8n.deine-domain.de`
+### Domain zuweisen
 
-6. **Deploy** → n8n erreichbar unter `https://n8n.deine-domain.de`
+1. Im Service Stack → Service **N8N** → **Settings**
+2. Unter **Domains** deine Domain eintragen (z.B. `n8n.deine-domain.de`)
+3. Coolify erstellt automatisch ein SSL-Zertifikat
 
-### Methode B: Eigenes Git-Repo mit Custom Dockerfile (für vorinstallierten Community Node)
+### Deploy
 
-Wenn du den Facebook Automation Node direkt im n8n-Image haben willst:
+1. Klicke **Deploy** (oder **Restart**)
+2. Der `n8n-node-installer` startet zuerst (~1 Min.): klont das Repo, baut den Node
+3. Danach starten n8n und der Worker – der Facebook Automation Node ist sofort verfügbar
+4. PostgreSQL und Redis bleiben unverändert – **keine Daten gehen verloren**
 
-1. Erstelle ein separates Git-Repo (z.B. `n8n-custom`) mit folgendem Dockerfile:
+### Bestehenden n8n Stack aktualisieren
 
-   ```dockerfile
-   FROM docker.n8n.io/n8nio/n8n:latest
+Falls du bereits einen n8n Service Stack hast (wie in deinem Fall):
 
-   USER root
-   RUN mkdir -p /home/node/.n8n/nodes/n8n-nodes-facebook-automation
+1. Gehe zu deinem bestehenden Stack → **Edit Compose File**
+2. Ersetze den Inhalt mit [`n8n-compose.yml`](n8n-compose.yml)
+3. **Save** → **Redeploy**
+4. Alle Workflows, Credentials und Einstellungen bleiben erhalten (liegen in PostgreSQL)
 
-   # Kopiere den gebauten Community Node
-   COPY n8n-node/dist /home/node/.n8n/nodes/n8n-nodes-facebook-automation/dist
-   COPY n8n-node/package.json /home/node/.n8n/nodes/n8n-nodes-facebook-automation/
-   COPY shared-types/dist /home/node/.n8n/nodes/n8n-nodes-facebook-automation/node_modules/@facebook-automation/shared-types/dist
-   COPY shared-types/package.json /home/node/.n8n/nodes/n8n-nodes-facebook-automation/node_modules/@facebook-automation/shared-types/
+### Facebook Automation Node aktualisieren
 
-   WORKDIR /home/node/.n8n/nodes/n8n-nodes-facebook-automation
-   RUN npm install --omit=dev
-
-   USER node
-   WORKDIR /home/node
-   ```
-
-2. In Coolify: **+ New Resource** → **Application** → Git-Provider → dieses Repo
-3. Build-Pack: **Dockerfile**
-4. Setze `N8N_CUSTOM_EXTENSIONS=/home/node/.n8n/nodes` als Environment Variable
-5. Konfiguriere Volumes, Port und Domain wie bei Methode A
-6. **Deploy**
-
-> **Wichtig:** Wenn beide Services im selben Coolify-Projekt liegen, können sie sich über den Container-Namen erreichen (kein öffentlicher Port nötig).
+Bei Änderungen am Node einfach den Service Stack **Redeployen** – der Installer klont immer die neueste Version aus dem Repo.
 
 ---
 
-## 5. n8n Community Node installieren
-
-### Methode 1: Über n8n UI (empfohlen)
-
-1. Öffne n8n → **Settings** (Zahnrad) → **Community Nodes**
-2. Klicke **Install a community node**
-3. Falls das npm-Paket veröffentlicht ist, gib ein: `n8n-nodes-facebook-automation`
-4. Klicke **Install**
-
-### Methode 2: Manuell per npm-Link (für private/unveröffentlichte Nodes)
-
-Da der Node vermutlich nicht auf npm veröffentlicht ist, musst du ihn manuell in den n8n-Container einbinden:
-
-1. **Node bauen** (lokal)
-   ```bash
-   # Im Projekt-Root
-   cd shared-types && npm install && npm run build && cd ..
-   cd n8n-node && npm install && npm run build && cd ..
-   ```
-
-2. **Node in n8n einbinden**
-
-   Erstelle ein eigenes n8n-Dockerfile:
-
-   ```dockerfile
-   FROM docker.n8n.io/n8nio/n8n:latest
-
-   # Custom Nodes installieren
-   USER root
-
-   # n8n custom nodes Verzeichnis
-   RUN mkdir -p /home/node/.n8n/custom
-
-   # Kopiere den gebauten Node
-   COPY n8n-node/dist /home/node/.n8n/nodes/n8n-nodes-facebook-automation/dist
-   COPY n8n-node/package.json /home/node/.n8n/nodes/n8n-nodes-facebook-automation/
-
-   # Kopiere shared-types
-   COPY shared-types/dist /home/node/.n8n/nodes/n8n-nodes-facebook-automation/node_modules/@facebook-automation/shared-types/dist
-   COPY shared-types/package.json /home/node/.n8n/nodes/n8n-nodes-facebook-automation/node_modules/@facebook-automation/shared-types/
-
-   # Installiere Abhängigkeiten
-   WORKDIR /home/node/.n8n/nodes/n8n-nodes-facebook-automation
-   RUN npm install --omit=dev
-
-   USER node
-   WORKDIR /home/node
-   ```
-
-3. **In Coolify deployen**
-   - Nutze dieses Dockerfile für dein n8n-Deployment
-   - Setze die Environment Variable:
-     ```
-     N8N_CUSTOM_EXTENSIONS=/home/node/.n8n/nodes
-     ```
-
-4. **n8n neu starten** → Der Node erscheint in der Node-Palette
-
-### Methode 3: Volume-Mount
-
-1. Baue den Node lokal (wie bei Methode 2, Schritt 1)
-2. Kopiere den gebauten `n8n-node/dist`-Ordner + `package.json` auf den Server
-3. Mounte das Verzeichnis als Volume in Coolify:
-   ```
-   /pfad/auf/server/n8n-nodes-facebook-automation:/home/node/.n8n/nodes/n8n-nodes-facebook-automation
-   ```
-4. Setze `N8N_CUSTOM_EXTENSIONS=/home/node/.n8n/nodes`
-
----
-
-## 6. n8n Credentials einrichten
-
-1. Öffne n8n → **Credentials** → **+ Add Credential**
+## 5. n8n Credentials einrichten
 2. Suche nach **Facebook Automation API**
 3. Fülle die Felder aus:
 
@@ -329,7 +243,7 @@ Da der Node vermutlich nicht auf npm veröffentlicht ist, musst du ihn manuell i
 
 ---
 
-## 7. Facebook Cookies exportieren
+## 6. Facebook Cookies exportieren
 
 ### Mit EditThisCookie (Chrome)
 
@@ -380,7 +294,7 @@ Da der Node vermutlich nicht auf npm veröffentlicht ist, musst du ihn manuell i
 
 ---
 
-## 8. Ersten Workflow erstellen
+## 7. Ersten Workflow erstellen
 
 ### Group Post Scraper
 
@@ -423,7 +337,7 @@ Ein vollständiges Workflow-Beispiel findest du in `examples/n8n-workflow-exampl
 
 ---
 
-## 9. Netzwerk & Sicherheit
+## 8. Netzwerk & Sicherheit
 
 ### Internes Netzwerk in Coolify
 
@@ -455,7 +369,7 @@ Damit n8n mit dem Facebook Automation Service kommunizieren kann, müssen beide 
 
 ---
 
-## 10. Troubleshooting
+## 9. Troubleshooting
 
 ### Build schlägt fehl: "Unable to connect to deb.debian.org"
 
