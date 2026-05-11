@@ -114,7 +114,8 @@ export class GroupPostScraper {
     // Find initial end_cursor for pagination
     // Try to extract doc_id from the HTML, with fallbacks
     const docId = this.extractDocId(html);
-    log.info({ groupId, fbDtsg: tokens.fbDtsg.substring(0, 10) + '...', docId }, 'Pagination tokens found');
+    const relayProviderVars = this.extractRelayProviderVariables(html);
+    log.info({ groupId, fbDtsg: tokens.fbDtsg.substring(0, 10) + '...', docId, relayVarsCount: Object.keys(relayProviderVars).length }, 'Pagination tokens found');
 
     let cursor = this.extractEndCursor(html);
     if (!cursor) {
@@ -141,6 +142,7 @@ export class GroupPostScraper {
           groupSlug,
           groupUrl,
           docId,
+          relayProviderVars,
         );
 
         if (!graphqlPosts || graphqlPosts.posts.length === 0) {
@@ -186,93 +188,72 @@ export class GroupPostScraper {
     groupSlug: string,
     referer: string,
     docId: string,
+    relayProviderVars: Record<string, unknown>,
   ): Promise<{ posts: GroupPost[]; nextCursor: string | null } | null> {
-    // Try multiple known doc_ids - Facebook rotates these periodically
-    const docIds = [
-      docId,
-      '8958826417468292',
-      '8387579444638498', 
-      '7828702393868967',
-      '9125270267582873',
-      '28068823496553498',
-    ];
+    const variables: Record<string, unknown> = {
+      count: 10,
+      cursor,
+      groupID: groupId,
+      id: groupId,
+      scale: 1,
+      ...relayProviderVars,
+    };
 
-    for (const tryDocId of docIds) {
-      const variables = JSON.stringify({
-        UFI2CommentsProvider_commentsKey: 'GroupsCometFeedRegularStoriesPaginationQuery',
-        count: 10,
-        cursor,
-        feedLocation: 'GROUP',
-        focusCommentID: null,
-        groupID: groupId,
-        id: groupId,
-        privacySelectorRenderLocation: 'COMET_STREAM',
-        renderLocation: 'group',
-        scale: 1,
-        sortingSetting: 'CHRONOLOGICAL',
-        stream_initial_count: 0,
-        useDefaultActor: false,
-      });
+    const params = new URLSearchParams({
+      av: this.httpClient.getUserId() || '0',
+      __a: '1',
+      __comet_req: '15',
+      fb_dtsg: tokens.fbDtsg,
+      fb_api_caller_class: 'RelayModern',
+      fb_api_req_friendly_name: 'GroupsCometFeedRegularStoriesPaginationQuery',
+      variables: JSON.stringify(variables),
+      server_timestamps: 'true',
+      doc_id: docId,
+    });
 
-      const params = new URLSearchParams({
-        av: '0',
-        __a: '1',
-        __comet_req: '15',
-        fb_dtsg: tokens.fbDtsg,
-        fb_api_caller_class: 'RelayModern',
-        fb_api_req_friendly_name: 'GroupsCometFeedRegularStoriesPaginationQuery',
-        variables,
-        server_timestamps: 'true',
-        doc_id: tryDocId,
-      });
+    if (tokens.jazoest) params.set('jazoest', tokens.jazoest);
+    if (tokens.lsd) params.set('lsd', tokens.lsd);
 
-      if (tokens.jazoest) params.set('jazoest', tokens.jazoest);
-      if (tokens.lsd) params.set('lsd', tokens.lsd);
+    const response = await this.httpClient.post(
+      'https://www.facebook.com/api/graphql/',
+      params.toString(),
+      { referer, timeout: 20000 },
+    );
 
-      const response = await this.httpClient.post(
-        'https://www.facebook.com/api/graphql/',
-        params.toString(),
-        { referer, timeout: 20000 },
-      );
-
-      if (response.statusCode !== 200) {
-        log.warn({ statusCode: response.statusCode, tryDocId }, 'GraphQL request failed');
-        continue;
-      }
-
-      // Check if the doc_id was rejected
-      if (response.body.includes('was not found') || response.body.includes('"CRITICAL"')) {
-        log.info({ tryDocId }, 'doc_id rejected, trying next');
-        continue;
-      }
-
-      log.info({ tryDocId, bodyLength: response.body.length }, 'GraphQL response received with valid doc_id');
-
-      const posts: GroupPost[] = [];
-      const seenIds = new Set<string>();
-      let nextCursor: string | null = null;
-
-      // Facebook returns multiple JSON objects separated by newlines
-      const lines = response.body.split('\n');
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) continue;
-
-        try {
-          const data = JSON.parse(trimmed);
-          this.walkJsonForPosts(data, posts, seenIds, groupName, groupSlug, 0);
-          const cursorVal = this.deepFindEndCursor(data);
-          if (cursorVal) nextCursor = cursorVal;
-        } catch {
-          // Not valid JSON
-        }
-      }
-
-      return { posts, nextCursor };
+    if (response.statusCode !== 200) {
+      log.warn({ statusCode: response.statusCode }, 'GraphQL request failed');
+      return null;
     }
 
-    log.warn('All doc_ids exhausted, none worked');
-    return null;
+    // Check if the doc_id was rejected (specific "not found" error)
+    if (response.body.includes('was not found')) {
+      log.warn({ docId }, 'doc_id not found, cannot paginate');
+      return null;
+    }
+
+    log.info({ docId, bodyLength: response.body.length }, 'GraphQL response received');
+
+    const posts: GroupPost[] = [];
+    const seenIds = new Set<string>();
+    let nextCursor: string | null = null;
+
+    // Facebook returns streaming JSONL - multiple JSON objects separated by newlines
+    const lines = response.body.split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) continue;
+
+      try {
+        const data = JSON.parse(trimmed);
+        this.walkJsonForPosts(data, posts, seenIds, groupName, groupSlug, 0);
+        const cursorVal = this.deepFindEndCursor(data);
+        if (cursorVal) nextCursor = cursorVal;
+      } catch {
+        // Not valid JSON
+      }
+    }
+
+    return { posts, nextCursor };
   }
 
   private extractGroupId(html: string): string | null {
@@ -327,22 +308,43 @@ export class GroupPostScraper {
     }
 
     log.info('Could not extract doc_id from HTML, using default');
-    return '8958826417468292';
+    return '26953539974284126';
   }
 
   private extractEndCursor(html: string): string | null {
-    // Look for end_cursor in the relay pagination info
-    const patterns = [
-      /"end_cursor"\s*:\s*"([^"]+)"/,
-      /"endCursor"\s*:\s*"([^"]+)"/,
-    ];
-
-    for (const pattern of patterns) {
-      const match = html.match(pattern);
-      if (match) return match[1];
+    // Find the long cursor near group_feed context (not short values like "3")
+    for (const cm of html.matchAll(/"end_cursor"\s*:\s*"([^"]{10,})"/g)) {
+      const ctx = html.substring(Math.max(0, cm.index! - 500), cm.index!);
+      if (ctx.includes('group_feed')) {
+        return cm[1];
+      }
     }
 
+    // Fallback: any long end_cursor
+    const fallback = html.match(/"end_cursor"\s*:\s*"([^"]{10,})"/)
+      || html.match(/"endCursor"\s*:\s*"([^"]{10,})"/);
+    if (fallback) return fallback[1];
+
     return null;
+  }
+
+  /**
+   * Extract __relay_internal__pv__ provided variable values from the HTML.
+   * Facebook embeds these in the initial page data. They include booleans,
+   * numbers, and strings that the Relay runtime needs for queries.
+   */
+  private extractRelayProviderVariables(html: string): Record<string, unknown> {
+    const pvValues: Record<string, unknown> = {};
+    for (const pvm of html.matchAll(/"(__relay_internal__pv__[^"]+)"\s*:\s*(true|false|null|\d+|"[^"]*")/g)) {
+      const name = pvm[1];
+      const raw = pvm[2];
+      if (raw === 'true') pvValues[name] = true;
+      else if (raw === 'false') pvValues[name] = false;
+      else if (raw === 'null') pvValues[name] = null;
+      else if (/^\d+$/.test(raw)) pvValues[name] = parseInt(raw);
+      else pvValues[name] = raw.replace(/^"|"$/g, '');
+    }
+    return pvValues;
   }
 
   private deepFindEndCursor(obj: unknown, depth = 0): string | null {
@@ -524,7 +526,7 @@ export class GroupPostScraper {
     // Only create a post if we have meaningful data (not just a bare reference)
     if (!message && !creationTime) return null;
 
-    const author = this.deepFindAuthor(obj);
+    const author = this.deepFindAuthor(obj) || this.deepFindOwningProfile(obj);
     const likes = this.deepFindNestedCount(obj, 'reaction_count', 'count');
     const comments =
       this.deepFindNestedCount(obj, 'comment_count', 'total_count') ??
@@ -547,6 +549,29 @@ export class GroupPostScraper {
   }
 
   // ---- Deep-find helpers (search within a single node's subtree) ----
+
+  private deepFindOwningProfile(obj: unknown, depth = 0): { name: string; url: string } | null {
+    if (depth > 20 || !obj || typeof obj !== 'object') return null;
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        const r = this.deepFindOwningProfile(item, depth + 1);
+        if (r) return r;
+      }
+      return null;
+    }
+    const record = obj as Record<string, unknown>;
+    if (record.owning_profile && typeof record.owning_profile === 'object') {
+      const op = record.owning_profile as Record<string, unknown>;
+      if (typeof op.name === 'string' && op.name.length > 1) {
+        return { name: op.name, url: typeof op.url === 'string' ? op.url : '' };
+      }
+    }
+    for (const value of Object.values(record)) {
+      const r = this.deepFindOwningProfile(value, depth + 1);
+      if (r) return r;
+    }
+    return null;
+  }
 
   private deepFindMessageText(obj: unknown, depth = 0): string | null {
     if (depth > 20 || !obj || typeof obj !== 'object') return null;

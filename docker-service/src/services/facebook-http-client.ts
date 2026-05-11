@@ -77,6 +77,13 @@ export class FacebookHttpClient {
   }
 
   /**
+   * Get the Facebook user ID (c_user cookie value).
+   */
+  getUserId(): string | null {
+    return this.cookies.get('c_user')?.value || null;
+  }
+
+  /**
    * Persist any updated cookies back to Redis.
    * Call this after all scraping is done.
    */
