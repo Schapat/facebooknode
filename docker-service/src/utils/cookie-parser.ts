@@ -75,7 +75,7 @@ export class CookieParser {
       throw new CookieParseError('Invalid Playwright storage state');
     }
 
-    return data.cookies.map((c) => this.normalizeCookie(c));
+    return data.cookies.map((c) => this.normalizeCookie(c as unknown as Record<string, unknown>));
   }
 
   private static parsePuppeteerArray(input: unknown): FacebookCookie[] {

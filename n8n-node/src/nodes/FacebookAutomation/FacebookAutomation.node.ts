@@ -1,11 +1,229 @@
 import {
+  IDataObject,
   IExecuteFunctions,
   INodeExecutionData,
   INodeType,
   INodeTypeDescription,
-  NodeConnectionType,
   NodeOperationError,
 } from 'n8n-workflow';
+
+async function ensureSession(
+  ctx: IExecuteFunctions,
+  apiUrl: string,
+  apiKey: string,
+  sessionName: string,
+  cookiesJson: string,
+  proxy: string,
+  userAgent: string,
+): Promise<void> {
+  try {
+    const statusResponse = await ctx.helpers.request({
+      method: 'GET',
+      url: `${apiUrl}/api/session/status?sessionName=${encodeURIComponent(sessionName)}`,
+      headers: { Authorization: `Bearer ${apiKey}` },
+      json: true,
+    });
+
+    if (statusResponse.success && statusResponse.data?.isValid) {
+      return;
+    }
+  } catch {
+    // Session doesn't exist, create it
+  }
+
+  if (!cookiesJson) {
+    throw new NodeOperationError(
+      ctx.getNode(),
+      'No cookies provided. Please configure Facebook cookies in the credentials.',
+    );
+  }
+
+  let cookies: unknown;
+  try {
+    cookies = JSON.parse(cookiesJson);
+  } catch {
+    throw new NodeOperationError(
+      ctx.getNode(),
+      'Invalid cookie JSON format. Please check your cookies configuration.',
+    );
+  }
+
+  const importBody: Record<string, unknown> = {
+    sessionName,
+    cookies,
+    format: 'json',
+  };
+
+  if (proxy) {
+    importBody.proxy = { server: proxy };
+  }
+  if (userAgent) {
+    importBody.userAgent = userAgent;
+  }
+
+  await ctx.helpers.request({
+    method: 'POST',
+    url: `${apiUrl}/api/session/import`,
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: importBody,
+    json: true,
+  });
+}
+
+async function waitForJob(
+  ctx: IExecuteFunctions,
+  apiUrl: string,
+  apiKey: string,
+  jobId: string,
+  options: Record<string, unknown>,
+): Promise<unknown> {
+  const pollInterval = (options.pollInterval as number) || 5000;
+  const maxWaitTime = (options.maxWaitTime as number) || 300000;
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < maxWaitTime) {
+    const statusResponse = await ctx.helpers.request({
+      method: 'GET',
+      url: `${apiUrl}/api/job/${jobId}`,
+      headers: { Authorization: `Bearer ${apiKey}` },
+      json: true,
+    });
+
+    const jobData = statusResponse.data;
+
+    if (jobData.status === 'completed') {
+      return jobData.result;
+    }
+
+    if (jobData.status === 'failed') {
+      throw new NodeOperationError(
+        ctx.getNode(),
+        `Job failed: ${jobData.error || 'Unknown error'}`,
+      );
+    }
+
+    await new Promise<void>((resolve) => setTimeout(resolve, pollInterval));
+  }
+
+  throw new NodeOperationError(
+    ctx.getNode(),
+    `Job ${jobId} timed out after ${maxWaitTime}ms`,
+  );
+}
+
+async function executeGroupPostScraper(
+  ctx: IExecuteFunctions,
+  apiUrl: string,
+  apiKey: string,
+  sessionName: string,
+  itemIndex: number,
+): Promise<unknown> {
+  const groupsRaw = ctx.getNodeParameter('groups', itemIndex) as string;
+  const groups = groupsRaw
+    .split('\n')
+    .map((g) => g.trim())
+    .filter((g) => g.length > 0);
+  const lastScrapeTimestamp = ctx.getNodeParameter('lastScrapeTimestamp', itemIndex, '') as string;
+  const maxPosts = ctx.getNodeParameter('maxPosts', itemIndex, 50) as number;
+  const options = ctx.getNodeParameter('options', itemIndex, {}) as Record<string, unknown>;
+
+  const response = await ctx.helpers.request({
+    method: 'POST',
+    url: `${apiUrl}/api/scrape/posts`,
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: {
+      sessionName,
+      groups,
+      lastScrapeTimestamp: lastScrapeTimestamp || undefined,
+      maxPosts,
+      scrollTimeout: options.scrollTimeout,
+    },
+    json: true,
+  });
+
+  if (options.waitForCompletion !== false) {
+    return waitForJob(ctx, apiUrl, apiKey, response.jobId, options);
+  }
+
+  return response;
+}
+
+async function executeGroupMemberScraper(
+  ctx: IExecuteFunctions,
+  apiUrl: string,
+  apiKey: string,
+  sessionName: string,
+  itemIndex: number,
+): Promise<unknown> {
+  const groupsRaw = ctx.getNodeParameter('memberGroups', itemIndex) as string;
+  const groups = groupsRaw
+    .split('\n')
+    .map((g) => g.trim())
+    .filter((g) => g.length > 0);
+  const maxMembers = ctx.getNodeParameter('maxMembers', itemIndex, 200) as number;
+  const options = ctx.getNodeParameter('options', itemIndex, {}) as Record<string, unknown>;
+
+  const response = await ctx.helpers.request({
+    method: 'POST',
+    url: `${apiUrl}/api/scrape/members`,
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: {
+      sessionName,
+      groups,
+      maxMembers,
+      scrollTimeout: options.scrollTimeout,
+    },
+    json: true,
+  });
+
+  if (options.waitForCompletion !== false) {
+    return waitForJob(ctx, apiUrl, apiKey, response.jobId, options);
+  }
+
+  return response;
+}
+
+async function executeAutoMessage(
+  ctx: IExecuteFunctions,
+  apiUrl: string,
+  apiKey: string,
+  sessionName: string,
+  itemIndex: number,
+): Promise<unknown> {
+  const username = ctx.getNodeParameter('username', itemIndex) as string;
+  const message = ctx.getNodeParameter('message', itemIndex) as string;
+  const options = ctx.getNodeParameter('options', itemIndex, {}) as Record<string, unknown>;
+
+  const response = await ctx.helpers.request({
+    method: 'POST',
+    url: `${apiUrl}/api/message/send`,
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: {
+      sessionName,
+      username,
+      message,
+    },
+    json: true,
+  });
+
+  if (options.waitForCompletion !== false) {
+    return waitForJob(ctx, apiUrl, apiKey, response.jobId, options);
+  }
+
+  return response;
+}
 
 export class FacebookAutomation implements INodeType {
   description: INodeTypeDescription = {
@@ -19,8 +237,8 @@ export class FacebookAutomation implements INodeType {
     defaults: {
       name: 'Facebook Automation',
     },
-    inputs: [NodeConnectionType.Main],
-    outputs: [NodeConnectionType.Main],
+    inputs: ['main'] as any,
+    outputs: ['main'] as any,
     credentials: [
       {
         name: 'facebookAutomationApi',
@@ -28,7 +246,6 @@ export class FacebookAutomation implements INodeType {
       },
     ],
     properties: [
-      // Operation Selection
       {
         displayName: 'Operation',
         name: 'operation',
@@ -56,24 +273,16 @@ export class FacebookAutomation implements INodeType {
         ],
         default: 'groupPostScraper',
       },
-
-      // ---- Group Post Scraper Fields ----
       {
         displayName: 'Group URLs',
         name: 'groups',
         type: 'string',
-        typeOptions: {
-          rows: 4,
-        },
+        typeOptions: { rows: 4 },
         default: '',
         placeholder: 'https://www.facebook.com/groups/123456\nhttps://www.facebook.com/groups/789012',
         description: 'Facebook group URLs (one per line)',
         required: true,
-        displayOptions: {
-          show: {
-            operation: ['groupPostScraper'],
-          },
-        },
+        displayOptions: { show: { operation: ['groupPostScraper'] } },
       },
       {
         displayName: 'Last Scrape Timestamp',
@@ -82,11 +291,7 @@ export class FacebookAutomation implements INodeType {
         default: '',
         placeholder: '2024-01-01T00:00:00Z',
         description: 'Only scrape posts newer than this timestamp (ISO 8601)',
-        displayOptions: {
-          show: {
-            operation: ['groupPostScraper'],
-          },
-        },
+        displayOptions: { show: { operation: ['groupPostScraper'] } },
       },
       {
         displayName: 'Max Posts',
@@ -94,30 +299,18 @@ export class FacebookAutomation implements INodeType {
         type: 'number',
         default: 50,
         description: 'Maximum number of posts to scrape per group',
-        displayOptions: {
-          show: {
-            operation: ['groupPostScraper'],
-          },
-        },
+        displayOptions: { show: { operation: ['groupPostScraper'] } },
       },
-
-      // ---- Group Member Scraper Fields ----
       {
         displayName: 'Group URLs',
         name: 'memberGroups',
         type: 'string',
-        typeOptions: {
-          rows: 4,
-        },
+        typeOptions: { rows: 4 },
         default: '',
         placeholder: 'https://www.facebook.com/groups/123456',
         description: 'Facebook group URLs (one per line)',
         required: true,
-        displayOptions: {
-          show: {
-            operation: ['groupMemberScraper'],
-          },
-        },
+        displayOptions: { show: { operation: ['groupMemberScraper'] } },
       },
       {
         displayName: 'Max Members',
@@ -125,14 +318,8 @@ export class FacebookAutomation implements INodeType {
         type: 'number',
         default: 200,
         description: 'Maximum number of members to scrape per group',
-        displayOptions: {
-          show: {
-            operation: ['groupMemberScraper'],
-          },
-        },
+        displayOptions: { show: { operation: ['groupMemberScraper'] } },
       },
-
-      // ---- Auto Message Fields ----
       {
         displayName: 'Username',
         name: 'username',
@@ -141,31 +328,19 @@ export class FacebookAutomation implements INodeType {
         placeholder: 'John Doe',
         description: 'The Facebook user to message',
         required: true,
-        displayOptions: {
-          show: {
-            operation: ['autoMessage'],
-          },
-        },
+        displayOptions: { show: { operation: ['autoMessage'] } },
       },
       {
         displayName: 'Message',
         name: 'message',
         type: 'string',
-        typeOptions: {
-          rows: 4,
-        },
+        typeOptions: { rows: 4 },
         default: '',
         placeholder: 'Hello! ...',
         description: 'The message to send',
         required: true,
-        displayOptions: {
-          show: {
-            operation: ['autoMessage'],
-          },
-        },
+        displayOptions: { show: { operation: ['autoMessage'] } },
       },
-
-      // ---- Common Options ----
       {
         displayName: 'Options',
         name: 'options',
@@ -218,8 +393,7 @@ export class FacebookAutomation implements INodeType {
     const proxy = credentials.proxy as string;
     const userAgent = credentials.userAgent as string;
 
-    // Ensure session exists
-    await this.ensureSession(apiUrl, apiKey, sessionName, cookiesJson, proxy, userAgent);
+    await ensureSession(this, apiUrl, apiKey, sessionName, cookiesJson, proxy, userAgent);
 
     const operation = this.getNodeParameter('operation', 0) as string;
 
@@ -229,13 +403,13 @@ export class FacebookAutomation implements INodeType {
 
         switch (operation) {
           case 'groupPostScraper':
-            result = await this.executeGroupPostScraper(apiUrl, apiKey, sessionName, i);
+            result = await executeGroupPostScraper(this, apiUrl, apiKey, sessionName, i);
             break;
           case 'groupMemberScraper':
-            result = await this.executeGroupMemberScraper(apiUrl, apiKey, sessionName, i);
+            result = await executeGroupMemberScraper(this, apiUrl, apiKey, sessionName, i);
             break;
           case 'autoMessage':
-            result = await this.executeAutoMessage(apiUrl, apiKey, sessionName, i);
+            result = await executeAutoMessage(this, apiUrl, apiKey, sessionName, i);
             break;
           default:
             throw new NodeOperationError(this.getNode(), `Unknown operation: ${operation}`);
@@ -243,10 +417,10 @@ export class FacebookAutomation implements INodeType {
 
         if (Array.isArray(result)) {
           for (const item of result) {
-            returnData.push({ json: item });
+            returnData.push({ json: item as IDataObject });
           }
         } else {
-          returnData.push({ json: result as Record<string, unknown> });
+          returnData.push({ json: result as IDataObject });
         }
       } catch (error) {
         if (this.continueOnFail()) {
@@ -262,226 +436,5 @@ export class FacebookAutomation implements INodeType {
     }
 
     return [returnData];
-  }
-
-  private async ensureSession(
-    this: IExecuteFunctions,
-    apiUrl: string,
-    apiKey: string,
-    sessionName: string,
-    cookiesJson: string,
-    proxy: string,
-    userAgent: string,
-  ): Promise<void> {
-    // Check if session already exists
-    try {
-      const statusResponse = await this.helpers.request({
-        method: 'GET',
-        url: `${apiUrl}/api/session/status?sessionName=${encodeURIComponent(sessionName)}`,
-        headers: { Authorization: `Bearer ${apiKey}` },
-        json: true,
-      });
-
-      if (statusResponse.success && statusResponse.data?.isValid) {
-        return; // Session exists and is valid
-      }
-    } catch {
-      // Session doesn't exist, create it
-    }
-
-    // Import session
-    if (!cookiesJson) {
-      throw new NodeOperationError(
-        this.getNode(),
-        'No cookies provided. Please configure Facebook cookies in the credentials.',
-      );
-    }
-
-    let cookies: unknown;
-    try {
-      cookies = JSON.parse(cookiesJson);
-    } catch {
-      throw new NodeOperationError(
-        this.getNode(),
-        'Invalid cookie JSON format. Please check your cookies configuration.',
-      );
-    }
-
-    const importBody: Record<string, unknown> = {
-      sessionName,
-      cookies,
-      format: 'json',
-    };
-
-    if (proxy) {
-      importBody.proxy = { server: proxy };
-    }
-    if (userAgent) {
-      importBody.userAgent = userAgent;
-    }
-
-    await this.helpers.request({
-      method: 'POST',
-      url: `${apiUrl}/api/session/import`,
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: importBody,
-      json: true,
-    });
-  }
-
-  private async executeGroupPostScraper(
-    this: IExecuteFunctions,
-    apiUrl: string,
-    apiKey: string,
-    sessionName: string,
-    itemIndex: number,
-  ): Promise<unknown> {
-    const groupsRaw = this.getNodeParameter('groups', itemIndex) as string;
-    const groups = groupsRaw
-      .split('\n')
-      .map((g) => g.trim())
-      .filter((g) => g.length > 0);
-    const lastScrapeTimestamp = this.getNodeParameter('lastScrapeTimestamp', itemIndex, '') as string;
-    const maxPosts = this.getNodeParameter('maxPosts', itemIndex, 50) as number;
-    const options = this.getNodeParameter('options', itemIndex, {}) as Record<string, unknown>;
-
-    const response = await this.helpers.request({
-      method: 'POST',
-      url: `${apiUrl}/api/scrape/posts`,
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: {
-        sessionName,
-        groups,
-        lastScrapeTimestamp: lastScrapeTimestamp || undefined,
-        maxPosts,
-        scrollTimeout: options.scrollTimeout,
-      },
-      json: true,
-    });
-
-    if (options.waitForCompletion !== false) {
-      return this.waitForJob(apiUrl, apiKey, response.jobId, options);
-    }
-
-    return response;
-  }
-
-  private async executeGroupMemberScraper(
-    this: IExecuteFunctions,
-    apiUrl: string,
-    apiKey: string,
-    sessionName: string,
-    itemIndex: number,
-  ): Promise<unknown> {
-    const groupsRaw = this.getNodeParameter('memberGroups', itemIndex) as string;
-    const groups = groupsRaw
-      .split('\n')
-      .map((g) => g.trim())
-      .filter((g) => g.length > 0);
-    const maxMembers = this.getNodeParameter('maxMembers', itemIndex, 200) as number;
-    const options = this.getNodeParameter('options', itemIndex, {}) as Record<string, unknown>;
-
-    const response = await this.helpers.request({
-      method: 'POST',
-      url: `${apiUrl}/api/scrape/members`,
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: {
-        sessionName,
-        groups,
-        maxMembers,
-        scrollTimeout: options.scrollTimeout,
-      },
-      json: true,
-    });
-
-    if (options.waitForCompletion !== false) {
-      return this.waitForJob(apiUrl, apiKey, response.jobId, options);
-    }
-
-    return response;
-  }
-
-  private async executeAutoMessage(
-    this: IExecuteFunctions,
-    apiUrl: string,
-    apiKey: string,
-    sessionName: string,
-    itemIndex: number,
-  ): Promise<unknown> {
-    const username = this.getNodeParameter('username', itemIndex) as string;
-    const message = this.getNodeParameter('message', itemIndex) as string;
-    const options = this.getNodeParameter('options', itemIndex, {}) as Record<string, unknown>;
-
-    const response = await this.helpers.request({
-      method: 'POST',
-      url: `${apiUrl}/api/message/send`,
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: {
-        sessionName,
-        username,
-        message,
-      },
-      json: true,
-    });
-
-    if (options.waitForCompletion !== false) {
-      return this.waitForJob(apiUrl, apiKey, response.jobId, options);
-    }
-
-    return response;
-  }
-
-  private async waitForJob(
-    this: IExecuteFunctions,
-    apiUrl: string,
-    apiKey: string,
-    jobId: string,
-    options: Record<string, unknown>,
-  ): Promise<unknown> {
-    const pollInterval = (options.pollInterval as number) || 5000;
-    const maxWaitTime = (options.maxWaitTime as number) || 300000;
-    const startTime = Date.now();
-
-    while (Date.now() - startTime < maxWaitTime) {
-      const statusResponse = await this.helpers.request({
-        method: 'GET',
-        url: `${apiUrl}/api/job/${jobId}`,
-        headers: { Authorization: `Bearer ${apiKey}` },
-        json: true,
-      });
-
-      const jobData = statusResponse.data;
-
-      if (jobData.status === 'completed') {
-        return jobData.result;
-      }
-
-      if (jobData.status === 'failed') {
-        throw new NodeOperationError(
-          this.getNode(),
-          `Job failed: ${jobData.error || 'Unknown error'}`,
-        );
-      }
-
-      // Wait before polling again
-      await new Promise((resolve) => setTimeout(resolve, pollInterval));
-    }
-
-    throw new NodeOperationError(
-      this.getNode(),
-      `Job ${jobId} timed out after ${maxWaitTime}ms`,
-    );
   }
 }
