@@ -187,63 +187,92 @@ export class GroupPostScraper {
     referer: string,
     docId: string,
   ): Promise<{ posts: GroupPost[]; nextCursor: string | null } | null> {
-    const variables = JSON.stringify({
-      count: 10,
-      cursor,
-      groupID: groupId,
-      id: groupId,
-      scale: 1,
-    });
+    // Try multiple known doc_ids - Facebook rotates these periodically
+    const docIds = [
+      docId,
+      '8958826417468292',
+      '8387579444638498', 
+      '7828702393868967',
+      '9125270267582873',
+      '28068823496553498',
+    ];
 
-    const params = new URLSearchParams({
-      fb_dtsg: tokens.fbDtsg,
-      fb_api_caller_class: 'RelayModern',
-      fb_api_req_friendly_name: 'GroupsCometFeedRegularStoriesPaginationQuery',
-      variables,
-      doc_id: docId,
-    });
+    for (const tryDocId of docIds) {
+      const variables = JSON.stringify({
+        UFI2CommentsProvider_commentsKey: 'GroupsCometFeedRegularStoriesPaginationQuery',
+        count: 10,
+        cursor,
+        feedLocation: 'GROUP',
+        focusCommentID: null,
+        groupID: groupId,
+        id: groupId,
+        privacySelectorRenderLocation: 'COMET_STREAM',
+        renderLocation: 'group',
+        scale: 1,
+        sortingSetting: 'CHRONOLOGICAL',
+        stream_initial_count: 0,
+        useDefaultActor: false,
+      });
 
-    if (tokens.jazoest) params.set('jazoest', tokens.jazoest);
-    if (tokens.lsd) params.set('lsd', tokens.lsd);
+      const params = new URLSearchParams({
+        av: '0',
+        __a: '1',
+        __comet_req: '15',
+        fb_dtsg: tokens.fbDtsg,
+        fb_api_caller_class: 'RelayModern',
+        fb_api_req_friendly_name: 'GroupsCometFeedRegularStoriesPaginationQuery',
+        variables,
+        server_timestamps: 'true',
+        doc_id: tryDocId,
+      });
 
-    const response = await this.httpClient.post(
-      'https://www.facebook.com/api/graphql/',
-      params.toString(),
-      { referer, timeout: 20000 },
-    );
+      if (tokens.jazoest) params.set('jazoest', tokens.jazoest);
+      if (tokens.lsd) params.set('lsd', tokens.lsd);
 
-    if (response.statusCode !== 200) {
-      log.warn({ statusCode: response.statusCode, bodySnippet: response.body.substring(0, 200) }, 'GraphQL request failed');
-      return null;
-    }
+      const response = await this.httpClient.post(
+        'https://www.facebook.com/api/graphql/',
+        params.toString(),
+        { referer, timeout: 20000 },
+      );
 
-    log.info({ bodyLength: response.body.length, bodySnippet: response.body.substring(0, 300) }, 'GraphQL response received');
-
-    const posts: GroupPost[] = [];
-    const seenIds = new Set<string>();
-    let nextCursor: string | null = null;
-
-    // Facebook returns multiple JSON objects separated by newlines
-    const lines = response.body.split('\n');
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) continue;
-
-      try {
-        const data = JSON.parse(trimmed);
-
-        // Extract posts from the GraphQL response
-        this.walkJsonForPosts(data, posts, seenIds, groupName, groupSlug, 0);
-
-        // Extract next cursor
-        const cursorVal = this.deepFindEndCursor(data);
-        if (cursorVal) nextCursor = cursorVal;
-      } catch {
-        // Not valid JSON
+      if (response.statusCode !== 200) {
+        log.warn({ statusCode: response.statusCode, tryDocId }, 'GraphQL request failed');
+        continue;
       }
+
+      // Check if the doc_id was rejected
+      if (response.body.includes('was not found') || response.body.includes('"CRITICAL"')) {
+        log.info({ tryDocId }, 'doc_id rejected, trying next');
+        continue;
+      }
+
+      log.info({ tryDocId, bodyLength: response.body.length }, 'GraphQL response received with valid doc_id');
+
+      const posts: GroupPost[] = [];
+      const seenIds = new Set<string>();
+      let nextCursor: string | null = null;
+
+      // Facebook returns multiple JSON objects separated by newlines
+      const lines = response.body.split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) continue;
+
+        try {
+          const data = JSON.parse(trimmed);
+          this.walkJsonForPosts(data, posts, seenIds, groupName, groupSlug, 0);
+          const cursorVal = this.deepFindEndCursor(data);
+          if (cursorVal) nextCursor = cursorVal;
+        } catch {
+          // Not valid JSON
+        }
+      }
+
+      return { posts, nextCursor };
     }
 
-    return { posts, nextCursor };
+    log.warn('All doc_ids exhausted, none worked');
+    return null;
   }
 
   private extractGroupId(html: string): string | null {
@@ -268,21 +297,17 @@ export class GroupPostScraper {
   }
 
   /**
-   * Extract the doc_id for GroupsCometFeedRegularStoriesPaginationQuery from page HTML.
+   * Extract doc_id candidates from page HTML.
    * Facebook embeds relay query doc_ids in their JavaScript bundles.
-   * Falls back to known doc_ids if extraction fails.
+   * We search for any doc_id near pagination-related keywords.
    */
   private extractDocId(html: string): string {
-    // Try to find the doc_id associated with GroupsCometFeedRegularStoriesPaginationQuery
+    // Strategy 1: Look for doc_id patterns near GroupsCometFeed references
     const patterns = [
-      // Pattern: "GroupsCometFeedRegularStoriesPaginationQuery"...doc_id:"NNNN"
-      /GroupsCometFeedRegularStoriesPaginationQuery[^}]*?(?:doc_id|id)\s*[:=]\s*"(\d+)"/,
-      // Pattern: doc_id:"NNNN"..."GroupsCometFeedRegularStoriesPaginationQuery"
-      /(?:doc_id|"id")\s*[:=]\s*"(\d+)"[^}]*GroupsCometFeedRegularStoriesPaginationQuery/,
-      // Pattern: {id:"NNNN",name:"GroupsCometFeedRegularStoriesPaginationQuery"
-      /"(\d{10,})"[^}]*?"GroupsCometFeedRegularStoriesPaginationQuery"/,
-      // Reverse pattern
-      /GroupsCometFeedRegularStoriesPaginationQuery"[^}]*?"(\d{10,})"/,
+      /GroupsCometFeedRegularStoriesPaginationQuery[^}]{0,500}?(?:doc_id|"id")\s*[:=]\s*"(\d{10,})"/,
+      /(?:doc_id|"id")\s*[:=]\s*"(\d{10,})"[^}]{0,500}?GroupsCometFeedRegularStoriesPaginationQuery/,
+      /"(\d{10,})"[^}]{0,200}?"GroupsCometFeedRegularStoriesPaginationQuery"/,
+      /GroupsCometFeedRegularStoriesPaginationQuery"[^}]{0,200}?"(\d{10,})"/,
     ];
 
     for (const pattern of patterns) {
@@ -293,9 +318,16 @@ export class GroupPostScraper {
       }
     }
 
-    // Fallback to known doc_ids (try multiple in case Facebook rotated)
+    // Strategy 2: Look for any doc_id near "GroupsCometFeed" in Relay preload data
+    // Facebook often has: preloadQuery("NNNN", {groupID:...})
+    const preloadMatch = html.match(/preload(?:Query|ed)\s*\(\s*"(\d{10,})"[^)]*groupID/i);
+    if (preloadMatch) {
+      log.info({ docId: preloadMatch[1] }, 'Extracted doc_id from preloadQuery');
+      return preloadMatch[1];
+    }
+
     log.info('Could not extract doc_id from HTML, using default');
-    return '9232369773455498';
+    return '8958826417468292';
   }
 
   private extractEndCursor(html: string): string | null {
