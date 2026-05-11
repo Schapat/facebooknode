@@ -20,6 +20,7 @@
 services:
   n8n-node-installer:
     image: 'node:20-slim'
+    restart: "no"
     volumes:
       - 'n8n-custom-nodes:/output'
     entrypoint: ['sh', '-c']
@@ -133,6 +134,8 @@ services:
       timeout: 20s
       retries: 10
     depends_on:
+      n8n-node-installer:
+        condition: service_completed_successfully
       n8n:
         condition: service_healthy
       postgresql:
