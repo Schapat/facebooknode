@@ -112,9 +112,11 @@ export class GroupPostScraper {
     }
 
     // Find initial end_cursor for pagination
+    log.info({ groupId, fbDtsg: tokens.fbDtsg.substring(0, 10) + '...' }, 'Pagination tokens found');
+
     let cursor = this.extractEndCursor(html);
     if (!cursor) {
-      log.debug('No pagination cursor found in initial HTML');
+      log.warn('No pagination cursor found in initial HTML');
       return;
     }
 
@@ -124,7 +126,7 @@ export class GroupPostScraper {
 
     while (posts.length < maxPosts && page < maxPages && cursor && !hitCutoff) {
       page++;
-      log.debug({ page, postsCount: posts.length, maxPosts }, 'Fetching next page via GraphQL');
+      log.info({ page, postsCount: posts.length, maxPosts }, 'Fetching next page via GraphQL');
 
       await randomDelay(1000, 3000);
 
@@ -139,7 +141,7 @@ export class GroupPostScraper {
         );
 
         if (!graphqlPosts || graphqlPosts.posts.length === 0) {
-          log.debug({ page }, 'No more posts from GraphQL');
+          log.info({ page }, 'No more posts from GraphQL');
           break;
         }
 
@@ -161,7 +163,7 @@ export class GroupPostScraper {
           if (posts.length >= maxPosts) break;
         }
 
-        log.debug({ page, newPostsAdded, total: posts.length }, 'GraphQL page processed');
+        log.info({ page, newPostsAdded, total: posts.length }, 'GraphQL page processed');
 
         if (newPostsAdded === 0) break;
 
@@ -207,9 +209,11 @@ export class GroupPostScraper {
     );
 
     if (response.statusCode !== 200) {
-      log.warn({ statusCode: response.statusCode }, 'GraphQL request failed');
+      log.warn({ statusCode: response.statusCode, bodySnippet: response.body.substring(0, 200) }, 'GraphQL request failed');
       return null;
     }
+
+    log.info({ bodyLength: response.body.length, bodySnippet: response.body.substring(0, 300) }, 'GraphQL response received');
 
     const posts: GroupPost[] = [];
     const seenIds = new Set<string>();
