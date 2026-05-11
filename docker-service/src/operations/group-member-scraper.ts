@@ -61,7 +61,7 @@ export class GroupMemberScraper {
     const seenProfiles = new Set<string>();
     const members = this.parseMembersFromHtml(response.body, groupName, maxMembers);
     for (const m of members) {
-      seenProfiles.add(m.profileName + '|' + m.profileUrl);
+      seenProfiles.add(m.profileName);
     }
     log.info({ groupName, initialMembers: members.length, maxMembers }, 'Initial page parsed');
 
@@ -139,9 +139,15 @@ export class GroupMemberScraper {
 
         let newMembersAdded = 0;
         for (const member of result.members) {
-          const key = member.profileName + '|' + member.profileUrl;
-          if (seenProfiles.has(key)) continue;
-          seenProfiles.add(key);
+          if (seenProfiles.has(member.profileName)) {
+            // Update existing entry if this one has a URL and the existing doesn't
+            if (member.profileUrl) {
+              const existingIdx = members.findIndex(m => m.profileName === member.profileName && !m.profileUrl);
+              if (existingIdx !== -1) members[existingIdx] = member;
+            }
+            continue;
+          }
+          seenProfiles.add(member.profileName);
           members.push(member);
           newMembersAdded++;
           if (members.length >= maxMembers) break;
@@ -423,9 +429,20 @@ export class GroupMemberScraper {
 
     // Check if this looks like a User node with name + URL
     const member = this.tryExtractMember(record, groupName);
-    if (member && !seenNames.has(member.profileName + '|' + member.profileUrl)) {
-      seenNames.add(member.profileName + '|' + member.profileUrl);
-      members.push(member);
+    if (member) {
+      // Dedup by profileName only - prefer entries that have a URL
+      if (seenNames.has(member.profileName)) {
+        // If this one has a URL and the existing one doesn't, replace it
+        if (member.profileUrl) {
+          const existingIdx = members.findIndex(m => m.profileName === member.profileName && !m.profileUrl);
+          if (existingIdx !== -1) {
+            members[existingIdx] = member;
+          }
+        }
+      } else {
+        seenNames.add(member.profileName);
+        members.push(member);
+      }
     }
 
     // Continue walking
@@ -549,14 +566,24 @@ export class GroupMemberScraper {
   // ==========================================
 
   private extractGroupName(html: string): string {
-    const jsonMatch = html.match(/"group"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/);
-    if (jsonMatch) return this.unescapeJson(jsonMatch[1]);
-
+    // Try to get group name from the page title first (most reliable)
     const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
     if (titleMatch) {
-      const title = titleMatch[1].replace(/\s*\|\s*Facebook.*$/, '').trim();
-      if (title && title !== 'Facebook') return this.decodeHtmlEntities(title);
+      const title = titleMatch[1]
+        .replace(/\s*\|\s*Facebook.*$/, '')
+        .replace(/\s*[-–]\s*Mitglieder.*$/i, '')
+        .replace(/\s*[-–]\s*Members.*$/i, '')
+        .trim();
+      if (title && title !== 'Facebook' && title.length > 1) return this.decodeHtmlEntities(title);
     }
+
+    // Try JSON pattern with __typename Group
+    const groupNameMatch = html.match(/"__typename"\s*:\s*"Group"[^}]*"name"\s*:\s*"([^"]+)"/);
+    if (groupNameMatch) return this.unescapeJson(groupNameMatch[1]);
+
+    // Fallback: "name" near "groupID"
+    const nearGroupId = html.match(/"groupID"\s*:\s*"\d+"[^}]{0,200}"name"\s*:\s*"([^"]+)"/);
+    if (nearGroupId) return this.unescapeJson(nearGroupId[1]);
 
     return 'Unknown Group';
   }

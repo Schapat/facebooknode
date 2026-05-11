@@ -148,13 +148,16 @@ export class BrowserService {
         return false;
       }
 
-      // Check for logged-in indicators
+      // Check for logged-in indicators (language-agnostic)
       const loggedIn = await page.evaluate(() => {
-        // Check for common logged-in elements
-        const profileLink = document.querySelector('[aria-label="Your profile"]');
+        // Check for profile link in any language (EN: "Your profile", DE: "Dein Profil", etc.)
+        const profileLink = document.querySelector('[aria-label="Your profile"], [aria-label="Dein Profil"], [aria-label="Votre profil"], [aria-label="Tu perfil"]');
         const navBar = document.querySelector('[role="navigation"]');
         const feed = document.querySelector('[role="feed"]');
-        return !!(profileLink || (navBar && feed));
+        // Also check for the account menu or messenger icon as logged-in indicator
+        const accountMenu = document.querySelector('[aria-label="Account"], [aria-label="Konto"], [aria-label="Compte"], [aria-label="Cuenta"]');
+        const messenger = document.querySelector('[aria-label="Messenger"]');
+        return !!(profileLink || accountMenu || messenger || (navBar && feed));
       });
 
       return loggedIn;
