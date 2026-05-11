@@ -18,17 +18,22 @@ export class GroupMemberScraper {
     await this.httpClient.initSession(sessionName);
     const allMembers: GroupMember[] = [];
 
-    for (const groupUrl of input.groups) {
-      log.info({ groupUrl }, 'Scraping group members via HTTP');
-      try {
-        const members = await this.scrapeMembers(groupUrl, input);
-        allMembers.push(...members);
-      } catch (error) {
-        log.error({ groupUrl, error }, 'Failed to scrape members');
+    try {
+      for (const groupUrl of input.groups) {
+        log.info({ groupUrl }, 'Scraping group members via HTTP');
+        try {
+          const members = await this.scrapeMembers(groupUrl, input);
+          allMembers.push(...members);
+        } catch (error) {
+          log.error({ groupUrl, error }, 'Failed to scrape members');
+        }
+        if (input.groups.indexOf(groupUrl) < input.groups.length - 1) {
+          await randomDelay(2000, 5000);
+        }
       }
-      if (input.groups.indexOf(groupUrl) < input.groups.length - 1) {
-        await randomDelay(2000, 5000);
-      }
+    } finally {
+      // Always persist rotated cookies back to Redis
+      await this.httpClient.persistCookies();
     }
 
     return allMembers;

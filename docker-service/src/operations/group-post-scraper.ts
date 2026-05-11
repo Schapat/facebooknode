@@ -18,17 +18,22 @@ export class GroupPostScraper {
     await this.httpClient.initSession(sessionName);
     const allPosts: GroupPost[] = [];
 
-    for (const groupUrl of input.groups) {
-      log.info({ groupUrl }, 'Scraping group posts via HTTP');
-      try {
-        const posts = await this.scrapeGroup(groupUrl, input);
-        allPosts.push(...posts);
-      } catch (error) {
-        log.error({ groupUrl, error }, 'Failed to scrape group');
+    try {
+      for (const groupUrl of input.groups) {
+        log.info({ groupUrl }, 'Scraping group posts via HTTP');
+        try {
+          const posts = await this.scrapeGroup(groupUrl, input);
+          allPosts.push(...posts);
+        } catch (error) {
+          log.error({ groupUrl, error }, 'Failed to scrape group');
+        }
+        if (input.groups.indexOf(groupUrl) < input.groups.length - 1) {
+          await randomDelay(2000, 5000);
+        }
       }
-      if (input.groups.indexOf(groupUrl) < input.groups.length - 1) {
-        await randomDelay(2000, 5000);
-      }
+    } finally {
+      // Always persist rotated cookies back to Redis
+      await this.httpClient.persistCookies();
     }
 
     return allPosts;
