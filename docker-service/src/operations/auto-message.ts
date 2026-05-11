@@ -63,6 +63,18 @@ export class AutoMessage {
         const foundFormAction = this.findPostForm(page.body);
         const titleMatch = page.body.match(/<title>([^<]*)<\/title>/i);
 
+        // Extract the actual page content (skip CSS/head, show body)
+        const bodyTagStart = page.body.indexOf('<body');
+        const contentStart = bodyTagStart > 0 ? bodyTagStart : 0;
+        // Also extract text content (strip tags) for readable error messages
+        const textContent = page.body
+          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .substring(0, 1000);
+
         results[url] = {
           statusCode: page.statusCode,
           bodyLength: page.body.length,
@@ -73,7 +85,8 @@ export class AutoMessage {
           hasBodyField,
           hasTextarea,
           detectedFormAction: foundFormAction,
-          bodySnippet: page.body.substring(0, 4000),
+          bodyContent: page.body.substring(contentStart, contentStart + 4000),
+          textContent,
         };
       } catch (error) {
         results[url] = { error: error instanceof Error ? error.message : String(error) };
