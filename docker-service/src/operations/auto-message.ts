@@ -106,6 +106,24 @@ export class AutoMessage {
       }
     }
 
+    // Last resort: mbasic has fb_dtsg in footer/locale-change forms
+    try {
+      log.debug('Trying mbasic.facebook.com for tokens');
+      const response = await this.httpClient.request('https://mbasic.facebook.com/');
+      const dtsgMatch = response.body.match(/name="fb_dtsg"\s+value="([^"]+)"/);
+      const jazoestMatch = response.body.match(/name="jazoest"\s+value="(\d+)"/);
+      if (dtsgMatch) {
+        log.debug('Extracted tokens from mbasic');
+        return {
+          fbDtsg: dtsgMatch[1],
+          jazoest: jazoestMatch ? jazoestMatch[1] : '',
+          lsd: '',
+        };
+      }
+    } catch (error) {
+      log.warn({ error }, 'Failed to extract tokens from mbasic');
+    }
+
     return { fbDtsg: '', jazoest: '', lsd: '' };
   }
 
@@ -145,23 +163,44 @@ export class AutoMessage {
       try {
         const response = await this.httpClient.request(profileUrl);
 
-        // Try multiple patterns to extract user ID from the profile HTML
-        const patterns = [
-          /"userID":"(\d+)"/,
-          /"entity_id":"(\d+)"/,
-          /"ownerID":"(\d+)"/,
-          /"profileID":"(\d+)"/,
+        // Priority 1: Profile-specific patterns (most reliable)
+        const specificPatterns = [
+          /"profileOwnerID"\s*:\s*"(\d+)"/,
           /content="fb:\/\/profile\/(\d+)"/,
-          /"user_id":"(\d+)"/,
-          /"actorID":"(\d+)"/,
+          /"profile_owner"\s*:\{[^}]*?"id"\s*:\s*"(\d+)"/,
         ];
 
-        for (const pattern of patterns) {
+        const myId = this.httpClient.getUserId();
+        for (const pattern of specificPatterns) {
           const match = response.body.match(pattern);
-          if (match && match[1] !== this.httpClient.getUserId()) {
-            log.info({ userId: match[1] }, 'Resolved user ID from profile page');
+          if (match && match[1] !== myId) {
+            log.info({ userId: match[1], pattern: pattern.source.substring(0, 30) }, 'Resolved user ID from specific pattern');
             return match[1];
           }
+        }
+
+        // Priority 2: Frequency analysis - most common non-self ID is likely the profile owner
+        const genericPatterns = [
+          /"userID"\s*:\s*"(\d+)"/g,
+          /"entity_id"\s*:\s*"(\d+)"/g,
+          /"ownerID"\s*:\s*"(\d+)"/g,
+          /"actorID"\s*:\s*"(\d+)"/g,
+        ];
+
+        const freq = new Map<string, number>();
+        for (const gp of genericPatterns) {
+          let m;
+          while ((m = gp.exec(response.body)) !== null) {
+            if (m[1] !== myId && m[1].length > 5) {
+              freq.set(m[1], (freq.get(m[1]) || 0) + 1);
+            }
+          }
+        }
+
+        if (freq.size > 0) {
+          const sorted = [...freq.entries()].sort((a, b) => b[1] - a[1]);
+          log.info({ userId: sorted[0][0], count: sorted[0][1] }, 'Resolved user ID by frequency analysis');
+          return sorted[0][0];
         }
       } catch (error) {
         log.warn({ error, profilePath }, 'Failed to fetch profile page, falling back to search');
@@ -345,7 +384,17 @@ export class AutoMessage {
   ): Promise<void> {
     const errors: string[] = [];
 
-    // Strategy 1: Legacy /messaging/send/ endpoint (most reliable with valid tokens)
+    // Strategy 1: GraphQL API (same mechanism as working scrapers)
+    try {
+      await this.sendViaGraphQL(recipientId, myUserId, message, tokens);
+      return;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      log.warn({ error: msg }, 'GraphQL send failed, trying next strategy');
+      errors.push(`graphql: ${msg}`);
+    }
+
+    // Strategy 2: Legacy /messaging/send/ endpoint
     try {
       await this.sendViaLegacyEndpoint(recipientId, myUserId, message, tokens);
       return;
@@ -355,27 +404,77 @@ export class AutoMessage {
       errors.push(`legacy: ${msg}`);
     }
 
-    // Strategy 2: mbasic.facebook.com HTML form
+    // Strategy 3: mbasic.facebook.com HTML form
     try {
       await this.sendViaMbasic(recipientId, message);
       return;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      log.warn({ error: msg }, 'mbasic send failed, trying next strategy');
+      log.warn({ error: msg }, 'mbasic send failed');
       errors.push(`mbasic: ${msg}`);
     }
 
-    // Strategy 3: m.facebook.com mobile compose
-    try {
-      await this.sendViaMobile(recipientId, message);
-      return;
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      log.warn({ error: msg }, 'Mobile send failed');
-      errors.push(`mobile: ${msg}`);
+    throw new MessageSendError(`All message send strategies failed: ${errors.join('; ')}`);
+  }
+
+  private async sendViaGraphQL(
+    recipientId: string,
+    myUserId: string,
+    message: string,
+    tokens: { fbDtsg: string; jazoest: string; lsd: string },
+  ): Promise<void> {
+    log.info({ recipientId }, 'Sending message via GraphQL API');
+
+    const variables = JSON.stringify({
+      input: {
+        message: { text: message },
+        otherUserFbId: recipientId,
+        source: 'messenger:web',
+        initiatingSource: 'messenger:send_message',
+      },
+    });
+
+    const params = new URLSearchParams({
+      fb_dtsg: tokens.fbDtsg,
+      jazoest: tokens.jazoest,
+      lsd: tokens.lsd,
+      fb_api_caller_class: 'RelayModern',
+      fb_api_req_friendly_name: 'useSendMessageMutation',
+      variables,
+      doc_id: '7316395148464937',
+      __user: myUserId,
+      __a: '1',
+    });
+
+    const response = await this.httpClient.post(
+      'https://www.facebook.com/api/graphql/',
+      params.toString(),
+      { referer: 'https://www.facebook.com/messages/t/' + recipientId },
+    );
+
+    const body = response.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
+    log.debug({ statusCode: response.statusCode, bodySnippet: body.substring(0, 500) }, 'GraphQL send response');
+
+    if (response.statusCode !== 200) {
+      throw new MessageSendError(`GraphQL returned HTTP ${response.statusCode}`);
     }
 
-    throw new MessageSendError(`All message send strategies failed: ${errors.join('; ')}`);
+    // Check for errors in response
+    try {
+      const data = JSON.parse(body);
+      if (data.error === 1357001 || body.includes('"errorSummary"')) {
+        throw new MessageSendError('GraphQL: session not authenticated');
+      }
+      if (data.errors && data.errors.length > 0) {
+        const errMsg = data.errors[0]?.message || JSON.stringify(data.errors);
+        throw new MessageSendError(`GraphQL error: ${errMsg}`);
+      }
+    } catch (e) {
+      if (e instanceof MessageSendError) throw e;
+      // If we got 200 and body isn't valid JSON or no errors found, assume success
+    }
+
+    log.info({ recipientId }, 'Message sent via GraphQL');
   }
 
   private async sendViaMbasic(recipientId: string, message: string): Promise<void> {
@@ -496,89 +595,5 @@ export class AutoMessage {
     }
 
     log.info({ recipientId }, 'Message sent via /messaging/send/');
-  }
-
-  private async sendViaMobile(recipientId: string, message: string): Promise<void> {
-    // Try m.facebook.com (regular mobile site, not mbasic) for messaging
-    const composeUrl = `https://m.facebook.com/messages/compose/?ids=${recipientId}`;
-    log.info({ recipientId }, 'Trying m.facebook.com message send');
-
-    const page = await this.httpClient.request(composeUrl, {
-      referer: 'https://m.facebook.com/',
-    });
-
-    if (this.httpClient.isLoginPage(page.body)) {
-      throw new MessageSendError('Session not valid on m.facebook.com (login page)');
-    }
-
-    // Look for any form that posts to a messaging endpoint
-    const formMatch =
-      page.body.match(/<form[^>]*action="(\/messages\/[^"]*)"[^>]*method="post"/i) ||
-      page.body.match(/<form[^>]*method="post"[^>]*action="(\/messages\/[^"]*)"/i);
-
-    if (!formMatch) {
-      // Try the thread URL format instead
-      const threadUrl = `https://m.facebook.com/messages/read/?tid=cid.c.${recipientId}%3A${this.httpClient.getUserId()}`;
-      const threadPage = await this.httpClient.request(threadUrl, {
-        referer: 'https://m.facebook.com/messages/',
-      });
-
-      const threadFormMatch =
-        threadPage.body.match(/<form[^>]*action="(\/messages\/[^"]*)"[^>]*method="post"/i) ||
-        threadPage.body.match(/<form[^>]*method="post"[^>]*action="(\/messages\/[^"]*)"/i);
-
-      if (!threadFormMatch) {
-        throw new MessageSendError('No message form found on m.facebook.com');
-      }
-
-      await this.submitMobileForm(threadPage.body, threadFormMatch[1], message, threadUrl, 'm.facebook.com');
-      return;
-    }
-
-    await this.submitMobileForm(page.body, formMatch[1], message, composeUrl, 'm.facebook.com');
-  }
-
-  private async submitMobileForm(
-    html: string,
-    formActionRaw: string,
-    message: string,
-    referer: string,
-    domain: string,
-  ): Promise<void> {
-    let formAction = formActionRaw.replace(/&amp;/g, '&');
-    if (!formAction.startsWith('http')) {
-      formAction = `https://${domain}${formAction}`;
-    }
-
-    const params = new URLSearchParams();
-    const hiddenRegex = /<input[^>]*type="hidden"[^>]*/gi;
-    let match;
-    while ((match = hiddenRegex.exec(html)) !== null) {
-      const tag = match[0];
-      const nameMatch = tag.match(/name="([^"]*)"/);
-      const valueMatch = tag.match(/value="([^"]*)"/);
-      if (nameMatch) {
-        params.append(
-          nameMatch[1].replace(/&amp;/g, '&'),
-          valueMatch ? valueMatch[1].replace(/&amp;/g, '&') : '',
-        );
-      }
-    }
-
-    params.append('body', message);
-    const submitMatch = html.match(/<input[^>]*name="send"[^>]*value="([^"]*)"/i);
-    params.append('send', submitMatch ? submitMatch[1] : 'Senden');
-
-    log.debug({ formAction }, `Submitting ${domain} message form`);
-
-    const response = await this.httpClient.post(formAction, params.toString(), {
-      referer,
-    });
-
-    if (response.statusCode >= 400) {
-      throw new MessageSendError(`${domain} send returned HTTP ${response.statusCode}`);
-    }
-
-    log.info(`Message sent via ${domain}`);
   }
 }

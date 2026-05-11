@@ -119,7 +119,7 @@ export class FacebookHttpClient {
   /**
    * Parse Set-Cookie headers from a response and merge into our cookie jar.
    */
-  private processSetCookieHeaders(headers: Record<string, string | string[] | undefined>): void {
+  private processSetCookieHeaders(headers: Record<string, string | string[] | undefined>, allowDeletion = true): void {
     const setCookieHeader = headers['set-cookie'];
     if (!setCookieHeader) return;
 
@@ -127,7 +127,7 @@ export class FacebookHttpClient {
 
     for (const cookieStr of cookieStrings) {
       try {
-        const cookie = this.parseSetCookie(cookieStr);
+        const cookie = this.parseSetCookie(cookieStr, allowDeletion);
         if (cookie && cookie.domain.includes('facebook.com')) {
           this.cookies.set(cookie.name, cookie);
           this.cookiesDirty = true;
@@ -141,7 +141,7 @@ export class FacebookHttpClient {
   /**
    * Parse a single Set-Cookie header string into a FacebookCookie.
    */
-  private parseSetCookie(setCookieStr: string): FacebookCookie | null {
+  private parseSetCookie(setCookieStr: string, allowDeletion = true): FacebookCookie | null {
     const parts = setCookieStr.split(';').map((p) => p.trim());
     if (parts.length === 0) return null;
 
@@ -189,8 +189,10 @@ export class FacebookHttpClient {
 
     // If a cookie is being deleted (max-age=0 or expires in the past), remove it
     if (expires > 0 && expires < Date.now() / 1000) {
-      this.cookies.delete(name);
-      this.cookiesDirty = true;
+      if (allowDeletion) {
+        this.cookies.delete(name);
+        this.cookiesDirty = true;
+      }
       return null;
     }
 
@@ -264,7 +266,8 @@ export class FacebookHttpClient {
       const response = await this.rawRequest(currentUrl, method, options);
 
       // Process Set-Cookie headers from EVERY response (including redirects)
-      this.processSetCookieHeaders(response.headers);
+      // Don't let error responses (400+) delete auth cookies from our jar
+      this.processSetCookieHeaders(response.headers, response.statusCode < 400);
 
       // Follow redirects
       const statusCode = response.statusCode;
@@ -341,10 +344,8 @@ export class FacebookHttpClient {
           delete headers['Upgrade-Insecure-Requests'];
           delete headers['Sec-Fetch-User'];
 
-          // Only set GraphQL-specific header for GraphQL endpoints
-          if (urlObj.pathname.includes('/api/graphql')) {
-            headers['X-FB-Friendly-Name'] = 'GroupsCometFeedRegularStoriesPaginationQuery';
-          }
+          // Add X-Requested-With for AJAX requests
+          headers['X-Requested-With'] = 'XMLHttpRequest';
         }
       }
 
