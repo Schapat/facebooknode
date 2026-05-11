@@ -38,8 +38,8 @@ export class QueueManager {
     this.queue = new Queue(QUEUE_NAME, connection);
     this.queueEvents = new QueueEvents(QUEUE_NAME, connection);
 
-    this.postScraper = new GroupPostScraper(browserService);
-    this.memberScraper = new GroupMemberScraper(browserService);
+    this.postScraper = new GroupPostScraper(sessionManager);
+    this.memberScraper = new GroupMemberScraper(sessionManager);
     this.autoMessage = new AutoMessage(browserService);
   }
 
