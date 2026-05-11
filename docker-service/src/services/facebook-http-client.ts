@@ -69,11 +69,20 @@ export class FacebookHttpClient {
       this.userAgent = session.userAgent;
     }
 
+    const preWarmupCookies = Array.from(this.cookies.keys());
+    const hasCUserBefore = this.cookies.has('c_user');
+    log.info({ cookieCount: preWarmupCookies.length, hasCUser: hasCUserBefore, cookieNames: preWarmupCookies }, 'Cookies loaded from Redis');
+
     // Warm-up request: visit facebook.com to get fresh cookie rotation
     log.debug('Performing warm-up request to establish cookie handshake');
     try {
       await this.request('https://www.facebook.com/', { timeout: 15000 });
-      log.debug({ cookieCount: this.cookies.size }, 'Warm-up complete, cookies updated');
+      const postWarmupCookies = Array.from(this.cookies.keys());
+      const hasCUserAfter = this.cookies.has('c_user');
+      log.info({ cookieCount: postWarmupCookies.length, hasCUser: hasCUserAfter, cookieNames: postWarmupCookies }, 'Warm-up complete, cookies updated');
+      if (hasCUserBefore && !hasCUserAfter) {
+        log.error('c_user cookie was DELETED during warm-up request!');
+      }
     } catch (error) {
       log.warn({ error }, 'Warm-up request failed, continuing with existing cookies');
     }
@@ -84,6 +93,19 @@ export class FacebookHttpClient {
    */
   getUserId(): string | null {
     return this.cookies.get('c_user')?.value || null;
+  }
+
+  /**
+   * Get cookie names for debugging (no values exposed).
+   */
+  getCookieDebugInfo(): { names: string[]; count: number; hasCUser: boolean; hasXs: boolean } {
+    const names = Array.from(this.cookies.keys());
+    return {
+      names,
+      count: names.length,
+      hasCUser: this.cookies.has('c_user'),
+      hasXs: this.cookies.has('xs'),
+    };
   }
 
   /**

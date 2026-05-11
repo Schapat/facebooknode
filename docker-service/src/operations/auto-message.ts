@@ -40,6 +40,7 @@ export class AutoMessage {
     const results: Record<string, unknown> = {};
     const myUserId = this.httpClient.getUserId();
     results.myUserId = myUserId;
+    results.cookieDebug = this.httpClient.getCookieDebugInfo();
 
     const urls = [
       `https://mbasic.facebook.com/messages/compose/?ids=${recipientId}`,
