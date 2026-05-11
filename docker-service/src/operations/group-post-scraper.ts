@@ -112,7 +112,9 @@ export class GroupPostScraper {
     }
 
     // Find initial end_cursor for pagination
-    log.info({ groupId, fbDtsg: tokens.fbDtsg.substring(0, 10) + '...' }, 'Pagination tokens found');
+    // Try to extract doc_id from the HTML, with fallbacks
+    const docId = this.extractDocId(html);
+    log.info({ groupId, fbDtsg: tokens.fbDtsg.substring(0, 10) + '...', docId }, 'Pagination tokens found');
 
     let cursor = this.extractEndCursor(html);
     if (!cursor) {
@@ -138,6 +140,7 @@ export class GroupPostScraper {
           groupName,
           groupSlug,
           groupUrl,
+          docId,
         );
 
         if (!graphqlPosts || graphqlPosts.posts.length === 0) {
@@ -182,6 +185,7 @@ export class GroupPostScraper {
     groupName: string,
     groupSlug: string,
     referer: string,
+    docId: string,
   ): Promise<{ posts: GroupPost[]; nextCursor: string | null } | null> {
     const variables = JSON.stringify({
       count: 10,
@@ -196,7 +200,7 @@ export class GroupPostScraper {
       fb_api_caller_class: 'RelayModern',
       fb_api_req_friendly_name: 'GroupsCometFeedRegularStoriesPaginationQuery',
       variables,
-      doc_id: '9232369773455498', // GroupsCometFeedRegularStoriesPaginationQuery
+      doc_id: docId,
     });
 
     if (tokens.jazoest) params.set('jazoest', tokens.jazoest);
@@ -261,6 +265,37 @@ export class GroupPostScraper {
     }
 
     return null;
+  }
+
+  /**
+   * Extract the doc_id for GroupsCometFeedRegularStoriesPaginationQuery from page HTML.
+   * Facebook embeds relay query doc_ids in their JavaScript bundles.
+   * Falls back to known doc_ids if extraction fails.
+   */
+  private extractDocId(html: string): string {
+    // Try to find the doc_id associated with GroupsCometFeedRegularStoriesPaginationQuery
+    const patterns = [
+      // Pattern: "GroupsCometFeedRegularStoriesPaginationQuery"...doc_id:"NNNN"
+      /GroupsCometFeedRegularStoriesPaginationQuery[^}]*?(?:doc_id|id)\s*[:=]\s*"(\d+)"/,
+      // Pattern: doc_id:"NNNN"..."GroupsCometFeedRegularStoriesPaginationQuery"
+      /(?:doc_id|"id")\s*[:=]\s*"(\d+)"[^}]*GroupsCometFeedRegularStoriesPaginationQuery/,
+      // Pattern: {id:"NNNN",name:"GroupsCometFeedRegularStoriesPaginationQuery"
+      /"(\d{10,})"[^}]*?"GroupsCometFeedRegularStoriesPaginationQuery"/,
+      // Reverse pattern
+      /GroupsCometFeedRegularStoriesPaginationQuery"[^}]*?"(\d{10,})"/,
+    ];
+
+    for (const pattern of patterns) {
+      const match = html.match(pattern);
+      if (match) {
+        log.info({ docId: match[1] }, 'Extracted doc_id from HTML');
+        return match[1];
+      }
+    }
+
+    // Fallback to known doc_ids (try multiple in case Facebook rotated)
+    log.info('Could not extract doc_id from HTML, using default');
+    return '9232369773455498';
   }
 
   private extractEndCursor(html: string): string | null {
