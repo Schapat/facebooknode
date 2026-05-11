@@ -8,7 +8,6 @@ import type {
   AutoMessageInput,
 } from '@facebook-automation/shared-types';
 import { RedisClient } from '../infrastructure/redis';
-import { BrowserService } from '../services/browser-service';
 import { SessionManager } from '../services/session-manager';
 import { GroupPostScraper } from '../operations/group-post-scraper';
 import { GroupMemberScraper } from '../operations/group-member-scraper';
@@ -30,7 +29,6 @@ export class QueueManager {
   constructor(
     private readonly redis: RedisClient,
     private readonly config: ServiceConfig,
-    private readonly browserService: BrowserService,
     private readonly sessionManager: SessionManager,
   ) {
     const connection = { connection: this.redis.getClient() };
@@ -40,7 +38,7 @@ export class QueueManager {
 
     this.postScraper = new GroupPostScraper(sessionManager);
     this.memberScraper = new GroupMemberScraper(sessionManager);
-    this.autoMessage = new AutoMessage(browserService);
+    this.autoMessage = new AutoMessage(sessionManager);
   }
 
   async initialize(): Promise<void> {

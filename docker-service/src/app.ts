@@ -7,7 +7,6 @@ import swaggerUi from '@fastify/swagger-ui';
 import type { ServiceConfig } from '@facebook-automation/shared-types';
 import type { RedisClient } from './infrastructure/redis';
 import type { SessionManager } from './services/session-manager';
-import type { BrowserService } from './services/browser-service';
 import type { QueueManager } from './queue/queue-manager';
 import { authMiddleware } from './middleware/auth';
 import { registerScrapeRoutes } from './routes/scrape';
@@ -22,7 +21,6 @@ interface AppDependencies {
   config: ServiceConfig;
   redis: RedisClient;
   sessionManager: SessionManager;
-  browserService: BrowserService;
   queueManager: QueueManager;
 }
 
@@ -45,7 +43,7 @@ export async function createApp(deps: AppDependencies): Promise<FastifyInstance>
     openapi: {
       info: {
         title: 'Facebook Automation API',
-        description: 'REST API for Facebook browser automation with Playwright',
+        description: 'REST API for Facebook automation via HTTP',
         version: '1.0.0',
       },
       components: {

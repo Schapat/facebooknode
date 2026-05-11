@@ -5,7 +5,6 @@ import { config } from './config';
 import { RedisClient } from './infrastructure/redis';
 import { QueueManager } from './queue/queue-manager';
 import { SessionManager } from './services/session-manager';
-import { BrowserService } from './services/browser-service';
 
 async function bootstrap(): Promise<void> {
   const redis = new RedisClient(config.redisUrl);
@@ -13,8 +12,7 @@ async function bootstrap(): Promise<void> {
   logger.info('Redis connected');
 
   const sessionManager = new SessionManager(redis, config);
-  const browserService = new BrowserService(config, sessionManager);
-  const queueManager = new QueueManager(redis, config, browserService, sessionManager);
+  const queueManager = new QueueManager(redis, config, sessionManager);
 
   await queueManager.initialize();
   logger.info('Queue system initialized');
@@ -23,7 +21,6 @@ async function bootstrap(): Promise<void> {
     config,
     redis,
     sessionManager,
-    browserService,
     queueManager,
   });
 
@@ -33,7 +30,6 @@ async function bootstrap(): Promise<void> {
   const shutdown = async (signal: string): Promise<void> => {
     logger.info(`${signal} received, shutting down gracefully...`);
     await queueManager.shutdown();
-    await browserService.closeAll();
     await redis.disconnect();
     await app.close();
     logger.info('Shutdown complete');

@@ -8,20 +8,8 @@ const envSchema = z.object({
   JWT_SECRET: z.string().min(32),
   REDIS_URL: z.string().default('redis://localhost:6379'),
   ENCRYPTION_KEY: z.string().min(32),
-  BROWSER_HEADLESS: z
-    .string()
-    .default('true')
-    .transform((v) => v === 'true'),
   MAX_CONCURRENCY: z.coerce.number().default(2),
   DEFAULT_TIMEOUT: z.coerce.number().default(60000),
-  SCREENSHOT_ON_ERROR: z
-    .string()
-    .default('true')
-    .transform((v) => v === 'true'),
-  HTML_DUMP_ON_ERROR: z
-    .string()
-    .default('true')
-    .transform((v) => v === 'true'),
   LOG_LEVEL: z.string().default('info'),
   WEBHOOK_URL: z.string().optional(),
   DATA_DIR: z.string().default('/data'),
@@ -36,11 +24,11 @@ export const config: ServiceConfig = {
   jwtSecret: env.JWT_SECRET,
   redisUrl: env.REDIS_URL,
   encryptionKey: env.ENCRYPTION_KEY,
-  browserHeadless: env.BROWSER_HEADLESS,
+  browserHeadless: true,
   maxConcurrency: env.MAX_CONCURRENCY,
   defaultTimeout: env.DEFAULT_TIMEOUT,
-  screenshotOnError: env.SCREENSHOT_ON_ERROR,
-  htmlDumpOnError: env.HTML_DUMP_ON_ERROR,
+  screenshotOnError: false,
+  htmlDumpOnError: false,
   logLevel: env.LOG_LEVEL,
   webhookUrl: env.WEBHOOK_URL,
   dataDir: env.DATA_DIR,

@@ -1,186 +1,59 @@
-import type { Page } from 'playwright';
 import type { MessageResult, AutoMessageInput } from '@facebook-automation/shared-types';
-import { BrowserService } from '../services/browser-service';
+import { FacebookHttpClient } from '../services/facebook-http-client';
+import { SessionManager } from '../services/session-manager';
 import { MessageSendError, UserNotFoundError } from '../errors';
 import { createChildLogger } from '../utils/logger';
 import { randomDelay } from '../utils/helpers';
 
 const log = createChildLogger({ service: 'AutoMessage' });
 
-// Language-agnostic selectors for Facebook Messenger
-// Strategy 1: aria-label based (To/An/À/Para)
-// Strategy 2: role-based (combobox, searchbox)
-// Strategy 3: placeholder-based
-// Strategy 4: generic input in Messenger context
-const TO_FIELD_SELECTORS = [
-  // Aria-label based - "To" field in multiple languages
-  'input[aria-label*="To"]',
-  'input[aria-label*="An"]',
-  'input[aria-label*="À"]',
-  'input[aria-label*="Para"]',
-  'input[aria-label*="Recipient"]',
-  'input[aria-label*="Empfänger"]',
-  // Role-based selectors
-  'input[role="combobox"]',
-  'input[role="searchbox"]',
-  // Placeholder-based
-  'input[placeholder*="To"]',
-  'input[placeholder*="An"]',
-  'input[placeholder*="Search"]',
-  'input[placeholder*="Suche"]',
-  'input[placeholder*="Suchen"]',
-  'input[placeholder*="Name"]',
-  // Name/type based
-  'input[name="participants"]',
-  'input[name="query"]',
-  // Messenger-specific structure: input within header/compose area
-  '[data-testid="messenger-composer-contact-search-input"]',
-  'form input[type="text"]',
-  'form input[type="search"]',
-  // Broader fallbacks
-  '[role="banner"] input[type="text"]',
-  '[role="dialog"] input[type="text"]',
-  'input[type="search"]',
-].join(', ');
-
-const USER_RESULT_SELECTORS = [
-  '[role="listbox"] [role="option"]',
-  '[role="list"] [role="listitem"]',
-  'ul[role="listbox"] li',
-  'ul li[role="option"]',
-  '[data-testid="mwthreadlist-item"]',
-  // Generic clickable results below search
-  '[role="listbox"] > *',
-  '[aria-expanded="true"] ~ * [role="option"]',
-].join(', ');
-
-const MESSAGE_INPUT_SELECTORS = [
-  '[role="textbox"][contenteditable="true"]',
-  'div[contenteditable="true"][aria-label]',
-  'div[contenteditable="true"][data-lexical-editor]',
-  'div[contenteditable="true"][spellcheck]',
-  'p[contenteditable="true"]',
-  'div[data-contents="true"]',
-  // Footer area textbox
-  '[role="main"] [role="textbox"]',
-  'footer [contenteditable="true"]',
-].join(', ');
-
 export class AutoMessage {
-  constructor(private readonly browserService: BrowserService) {}
+  private httpClient: FacebookHttpClient;
 
-  async execute(sessionName: string, input: AutoMessageInput): Promise<MessageResult> {
-    return this.browserService.executeWithSession(sessionName, async (page) => {
-      return this.sendMessage(page, input);
-    });
+  constructor(private readonly sessionManager: SessionManager) {
+    this.httpClient = new FacebookHttpClient(sessionManager);
   }
 
-  private async sendMessage(page: Page, input: AutoMessageInput): Promise<MessageResult> {
+  async execute(sessionName: string, input: AutoMessageInput): Promise<MessageResult> {
+    await this.httpClient.initSession(sessionName);
+    try {
+      return await this.sendMessage(input);
+    } finally {
+      await this.httpClient.persistCookies();
+    }
+  }
+
+  private async sendMessage(input: AutoMessageInput): Promise<MessageResult> {
     const { username, message } = input;
 
-    log.info({ username }, 'Sending message');
+    log.info({ username }, 'Sending message via HTTP');
 
     try {
-      // Navigate to Facebook Messenger new message page
-      await page.goto('https://www.facebook.com/messages/new/', {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000,
-      });
-      await randomDelay(2000, 4000);
+      // Step 1: Get fb_dtsg and other tokens from Facebook
+      const homeResponse = await this.httpClient.request('https://www.facebook.com/');
+      const tokens = this.httpClient.extractTokens(homeResponse.body);
 
-      // Wait for Messenger UI to load - look for any input or textbox
-      await page.waitForSelector('input, [contenteditable="true"], [role="textbox"]', { timeout: 15000 }).catch(() => null);
-      await randomDelay(500, 1000);
-
-      // Search for user in the "To" field - try multiple strategies
-      log.info('Looking for recipient input field');
-      let toField = await page.waitForSelector(TO_FIELD_SELECTORS, { timeout: 10000 }).catch(() => null);
-
-      // Fallback: if no specific selector matched, try finding any visible text input on the page
-      if (!toField) {
-        log.info('Primary selectors failed, trying fallback input detection');
-        const inputs = await page.$$('input[type="text"], input:not([type]), input[type="search"]');
-        for (const input of inputs) {
-          const visible = await input.isVisible().catch(() => false);
-          if (visible) {
-            toField = input;
-            log.info('Found fallback input element');
-            break;
-          }
-        }
+      if (!tokens.fbDtsg) {
+        throw new MessageSendError('Could not extract fb_dtsg token - session may be expired');
       }
 
-      if (!toField) {
-        const pageContent = await page.content();
-        const hasLoginForm = pageContent.includes('login_form') || pageContent.includes('loginbutton');
-        if (hasLoginForm) {
-          throw new MessageSendError('Session expired - redirected to login page');
-        }
-        // Log diagnostic info
-        const pageUrl = page.url();
-        const inputCount = (pageContent.match(/<input/gi) || []).length;
-        const contentEditableCount = (pageContent.match(/contenteditable="true"/gi) || []).length;
-        log.warn({ pageUrl, inputCount, contentEditableCount }, 'Could not find recipient input - page diagnostics');
-        throw new MessageSendError(`Could not find recipient input field on ${pageUrl} (inputs: ${inputCount}, contenteditable: ${contentEditableCount})`);
+      const myUserId = this.httpClient.getUserId();
+      if (!myUserId) {
+        throw new MessageSendError('Could not determine own user ID from cookies');
       }
 
-      // Type the username
-      await toField.click();
-      await randomDelay(300, 600);
+      // Step 2: Resolve username to Facebook user ID
+      const recipientId = await this.resolveUserId(username, tokens);
 
-      // Type username character by character for natural behavior
-      for (const char of username) {
-        await page.keyboard.type(char, { delay: Math.floor(Math.random() * 80) + 30 });
-      }
-
-      await randomDelay(2000, 3000);
-
-      // Wait for search results and click the first matching user
-      log.info('Waiting for user search results');
-      const userResult = await page
-        .waitForSelector(USER_RESULT_SELECTORS, { timeout: 10000 })
-        .catch(() => null);
-
-      if (!userResult) {
-        throw new UserNotFoundError(username);
-      }
-
-      await userResult.click();
       await randomDelay(1000, 2000);
 
-      // Find the message input - after selecting a recipient, a textbox should appear
-      log.info('Looking for message input field');
-      const messageInput = await page
-        .waitForSelector(MESSAGE_INPUT_SELECTORS, { timeout: 10000 })
-        .catch(() => null);
-
-      if (!messageInput) {
-        throw new MessageSendError('Could not find message input field');
-      }
-
-      // Type message with human-like delays
-      await messageInput.click();
-      await randomDelay(500, 1000);
-
-      for (const char of message) {
-        await page.keyboard.type(char, { delay: Math.floor(Math.random() * 60) + 20 });
-      }
-
-      await randomDelay(500, 1000);
-
-      // Send the message with Enter
-      await page.keyboard.press('Enter');
-      await randomDelay(2000, 3000);
+      // Step 3: Send the message via /messaging/send/
+      await this.sendViaMessaging(recipientId, myUserId, message, tokens);
 
       const sentAt = new Date().toISOString();
+      log.info({ username, recipientId, sentAt }, 'Message sent successfully');
 
-      log.info({ username, sentAt }, 'Message sent successfully');
-
-      return {
-        success: true,
-        sentAt,
-        username,
-      };
+      return { success: true, sentAt, username };
     } catch (error) {
       if (error instanceof UserNotFoundError || error instanceof MessageSendError) {
         throw error;
@@ -194,5 +67,147 @@ export class AutoMessage {
         error: error instanceof Error ? error.message : 'Unknown error',
       };
     }
+  }
+
+  private async resolveUserId(
+    username: string,
+    tokens: { fbDtsg: string; jazoest: string; lsd: string },
+  ): Promise<string> {
+    // If the username is already a numeric ID, use it directly
+    if (/^\d+$/.test(username)) {
+      return username;
+    }
+
+    // Strip full URL to get just the username/path part
+    let profilePath = username;
+    if (username.startsWith('http')) {
+      try {
+        const url = new URL(username);
+        profilePath = url.pathname.replace(/^\//, '').replace(/\/$/, '');
+      } catch {
+        // Not a valid URL, use as-is
+      }
+    }
+
+    // Try to resolve by fetching the profile page
+    const profileUrl = `https://www.facebook.com/${profilePath}`;
+    log.info({ profileUrl }, 'Resolving user ID from profile');
+
+    const response = await this.httpClient.request(profileUrl);
+
+    // Try multiple patterns to extract user ID from the profile HTML
+    const patterns = [
+      /"userID":"(\d+)"/,
+      /"entity_id":"(\d+)"/,
+      /"ownerID":"(\d+)"/,
+      /"profileID":"(\d+)"/,
+      /content="fb:\/\/profile\/(\d+)"/,
+      /"user_id":"(\d+)"/,
+      /"actorID":"(\d+)"/,
+    ];
+
+    for (const pattern of patterns) {
+      const match = response.body.match(pattern);
+      if (match && match[1] !== this.httpClient.getUserId()) {
+        log.info({ userId: match[1] }, 'Resolved user ID from profile page');
+        return match[1];
+      }
+    }
+
+    // Fallback: try the typeahead search
+    return this.searchUser(profilePath, tokens);
+  }
+
+  private async searchUser(
+    query: string,
+    tokens: { fbDtsg: string; jazoest: string; lsd: string },
+  ): Promise<string> {
+    log.info({ query }, 'Searching for user via typeahead');
+
+    const params = new URLSearchParams({
+      value: query,
+      fb_dtsg: tokens.fbDtsg,
+      jazoest: tokens.jazoest,
+      __a: '1',
+    });
+
+    const response = await this.httpClient.request(
+      `https://www.facebook.com/ajax/typeahead/search.php?${params.toString()}&type=messenger_people`,
+      { referer: 'https://www.facebook.com/messages/' },
+    );
+
+    // Facebook AJAX responses have "for (;;);" prefix
+    const body = response.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
+
+    try {
+      const data = JSON.parse(body);
+      const entries = data?.payload?.entries || data?.entries || [];
+      if (entries.length > 0) {
+        const userId = String(entries[0].uid || entries[0].id);
+        log.info({ userId, query }, 'Found user via typeahead search');
+        return userId;
+      }
+    } catch {
+      // Try regex fallback on the response
+      const idMatch = body.match(/"uid"\s*:\s*(\d+)/);
+      if (idMatch) {
+        return idMatch[1];
+      }
+    }
+
+    throw new UserNotFoundError(query);
+  }
+
+  private async sendViaMessaging(
+    recipientId: string,
+    myUserId: string,
+    message: string,
+    tokens: { fbDtsg: string; jazoest: string; lsd: string },
+  ): Promise<void> {
+    const timestamp = Date.now();
+    const otherUserId = `fbid:${recipientId}`;
+    const selfId = `fbid:${myUserId}`;
+
+    const params = new URLSearchParams();
+    params.append('fb_dtsg', tokens.fbDtsg);
+    params.append('jazoest', tokens.jazoest);
+    params.append('message_batch[0][action_type]', 'ma-type:user-generated-message');
+    params.append('message_batch[0][author]', selfId);
+    params.append('message_batch[0][body]', message);
+    params.append('message_batch[0][ephemeral_ttl_mode]', '0');
+    params.append('message_batch[0][has_attachment]', 'false');
+    params.append('message_batch[0][is_spoof_warning]', 'false');
+    params.append('message_batch[0][source]', 'source:web');
+    params.append('message_batch[0][specific_to_list][0]', otherUserId);
+    params.append('message_batch[0][specific_to_list][1]', selfId);
+    params.append('message_batch[0][timestamp]', String(timestamp));
+    params.append('__a', '1');
+
+    const response = await this.httpClient.post(
+      'https://www.facebook.com/messaging/send/',
+      params.toString(),
+      { referer: 'https://www.facebook.com/messages/' },
+    );
+
+    if (response.statusCode !== 200) {
+      throw new MessageSendError(`HTTP ${response.statusCode} from messaging endpoint`);
+    }
+
+    // Facebook AJAX responses have "for (;;);" prefix
+    const body = response.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
+
+    try {
+      const data = JSON.parse(body);
+      if (data.error) {
+        throw new MessageSendError(
+          `Facebook error: ${data.error.message || JSON.stringify(data.error)}`,
+        );
+      }
+    } catch (e) {
+      if (e instanceof MessageSendError) throw e;
+      // If we can't parse the response but got 200, assume success
+    }
+
+    log.info({ recipientId }, 'Message sent via /messaging/send/');
   }
 }
