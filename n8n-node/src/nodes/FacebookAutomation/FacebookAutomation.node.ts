@@ -121,11 +121,13 @@ async function executeGroupPostScraper(
   sessionName: string,
   itemIndex: number,
 ): Promise<unknown> {
-  const groupsRaw = ctx.getNodeParameter('groups', itemIndex) as string;
-  const groups = groupsRaw
-    .split('\n')
-    .map((g) => g.trim())
-    .filter((g) => g.length > 0);
+  const groupsRaw = ctx.getNodeParameter('groups', itemIndex);
+  const groups = Array.isArray(groupsRaw)
+    ? groupsRaw.map((g) => String(g).trim()).filter((g) => g.length > 0)
+    : String(groupsRaw)
+        .split('\n')
+        .map((g) => g.trim())
+        .filter((g) => g.length > 0);
   const lastScrapeTimestamp = ctx.getNodeParameter('lastScrapeTimestamp', itemIndex, '') as string;
   const maxPosts = ctx.getNodeParameter('maxPosts', itemIndex, 50) as number;
   const options = ctx.getNodeParameter('options', itemIndex, {}) as Record<string, unknown>;
@@ -161,11 +163,13 @@ async function executeGroupMemberScraper(
   sessionName: string,
   itemIndex: number,
 ): Promise<unknown> {
-  const groupsRaw = ctx.getNodeParameter('memberGroups', itemIndex) as string;
-  const groups = groupsRaw
-    .split('\n')
-    .map((g) => g.trim())
-    .filter((g) => g.length > 0);
+  const groupsRaw = ctx.getNodeParameter('memberGroups', itemIndex);
+  const groups = Array.isArray(groupsRaw)
+    ? groupsRaw.map((g) => String(g).trim()).filter((g) => g.length > 0)
+    : String(groupsRaw)
+        .split('\n')
+        .map((g) => g.trim())
+        .filter((g) => g.length > 0);
   const maxMembers = ctx.getNodeParameter('maxMembers', itemIndex, 200) as number;
   const options = ctx.getNodeParameter('options', itemIndex, {}) as Record<string, unknown>;
 
