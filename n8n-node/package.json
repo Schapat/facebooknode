@@ -1,0 +1,41 @@
+{
+  "name": "n8n-nodes-facebook-automation",
+  "version": "1.0.0",
+  "description": "n8n community node for Facebook Automation (browser-based, cookie auth)",
+  "keywords": [
+    "n8n-community-node-package",
+    "facebook",
+    "automation",
+    "scraping",
+    "messenger"
+  ],
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc && gulp build:icons",
+    "dev": "tsc --watch",
+    "lint": "eslint src/**/*.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "credentials": [
+      "dist/credentials/FacebookAutomationApi.credentials.js"
+    ],
+    "nodes": [
+      "dist/nodes/FacebookAutomation/FacebookAutomation.node.js"
+    ]
+  },
+  "dependencies": {
+    "@facebook-automation/shared-types": "file:../shared-types"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "gulp": "^4.0.2",
+    "n8n-workflow": "^1.30.0",
+    "typescript": "^5.4.0"
+  },
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  },
+  "license": "MIT"
+}

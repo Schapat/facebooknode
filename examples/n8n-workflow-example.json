@@ -1,0 +1,100 @@
+{
+  "name": "Facebook Group Post Scraper",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "groupPostScraper",
+        "groups": "https://www.facebook.com/groups/YOUR_GROUP_ID",
+        "maxPosts": 50,
+        "options": {
+          "waitForCompletion": true,
+          "pollInterval": 5000,
+          "maxWaitTime": 300000
+        }
+      },
+      "name": "Scrape Group Posts",
+      "type": "n8n-nodes-facebook-automation.facebookAutomation",
+      "typeVersion": 1,
+      "position": [450, 300],
+      "credentials": {
+        "facebookAutomationApi": {
+          "id": "1",
+          "name": "Facebook Automation API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "groupMemberScraper",
+        "memberGroups": "https://www.facebook.com/groups/YOUR_GROUP_ID",
+        "maxMembers": 200,
+        "options": {
+          "waitForCompletion": true
+        }
+      },
+      "name": "Scrape Group Members",
+      "type": "n8n-nodes-facebook-automation.facebookAutomation",
+      "typeVersion": 1,
+      "position": [450, 500],
+      "credentials": {
+        "facebookAutomationApi": {
+          "id": "1",
+          "name": "Facebook Automation API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "autoMessage",
+        "username": "={{$json.profileName}}",
+        "message": "Hello {{$json.profileName}}! Thanks for being part of the group.",
+        "options": {
+          "waitForCompletion": true
+        }
+      },
+      "name": "Send Welcome Message",
+      "type": "n8n-nodes-facebook-automation.facebookAutomation",
+      "typeVersion": 1,
+      "position": [650, 500],
+      "credentials": {
+        "facebookAutomationApi": {
+          "id": "1",
+          "name": "Facebook Automation API"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          { "node": "Scrape Group Posts", "type": "main", "index": 0 },
+          { "node": "Scrape Group Members", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Scrape Group Members": {
+      "main": [
+        [
+          { "node": "Send Welcome Message", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  }
+}

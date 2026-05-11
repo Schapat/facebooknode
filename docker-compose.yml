@@ -1,0 +1,68 @@
+# ============================================
+# Facebook Automation - Docker Compose
+# ============================================
+
+version: '3.8'
+
+services:
+  # ---- Redis ----
+  redis:
+    image: redis:7-alpine
+    container_name: fb-automation-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- Facebook Automation Service ----
+  facebook-automation:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fb-automation-service
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    volumes:
+      - automation-data:/data
+    environment:
+      - PORT=3000
+      - HOST=0.0.0.0
+      - API_KEYS=${API_KEYS:-change-me-api-key}
+      - JWT_SECRET=${JWT_SECRET:-change-me-jwt-secret-at-least-32chars}
+      - REDIS_URL=redis://redis:6379
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-change-me-encryption-key-32chars!}
+      - BROWSER_HEADLESS=true
+      - MAX_CONCURRENCY=${MAX_CONCURRENCY:-2}
+      - DEFAULT_TIMEOUT=${DEFAULT_TIMEOUT:-60000}
+      - SCREENSHOT_ON_ERROR=true
+      - HTML_DUMP_ON_ERROR=true
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - WEBHOOK_URL=${WEBHOOK_URL:-}
+      - DATA_DIR=/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "const http = require('http'); const req = http.request({ hostname: 'localhost', port: 3000, path: '/health', timeout: 5000 }, (res) => { process.exit(res.statusCode === 200 ? 0 : 1); }); req.on('error', () => process.exit(1)); req.end();"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    # Shared memory for Chromium
+    shm_size: '2gb'
+    security_opt:
+      - seccomp=unconfined
+
+volumes:
+  redis-data:
+    driver: local
+  automation-data:
+    driver: local

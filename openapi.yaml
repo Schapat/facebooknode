@@ -1,0 +1,377 @@
+openapi: '3.0.3'
+info:
+  title: Facebook Automation API
+  description: REST API for Facebook browser automation with Playwright
+  version: '1.0.0'
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      name: Authorization
+      in: header
+      description: 'Use "Bearer <key>" or "ApiKey <key>"'
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    ApiResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          type: object
+        error:
+          type: string
+        errorCode:
+          type: string
+        requiresRelogin:
+          type: boolean
+        jobId:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+
+    GroupPost:
+      type: object
+      properties:
+        groupName:
+          type: string
+        postId:
+          type: string
+        authorName:
+          type: string
+        authorProfileUrl:
+          type: string
+        title:
+          type: string
+        content:
+          type: string
+        createdAt:
+          type: string
+        likes:
+          type: integer
+        comments:
+          type: integer
+        postUrl:
+          type: string
+
+    GroupMember:
+      type: object
+      properties:
+        groupName:
+          type: string
+        profileName:
+          type: string
+        profileUrl:
+          type: string
+        bio:
+          type: string
+        location:
+          type: string
+        mutualFriends:
+          type: integer
+        joinedDate:
+          type: string
+
+    MessageResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+        sentAt:
+          type: string
+          format: date-time
+        username:
+          type: string
+        error:
+          type: string
+
+    SessionImport:
+      type: object
+      required:
+        - sessionName
+        - cookies
+      properties:
+        sessionName:
+          type: string
+        cookies:
+          description: Cookie array or Playwright storage state
+        format:
+          type: string
+          enum: [chrome-export, editthiscookie, playwright-state, puppeteer-array, json]
+          default: json
+        userAgent:
+          type: string
+        proxy:
+          type: object
+          properties:
+            server:
+              type: string
+            username:
+              type: string
+            password:
+              type: string
+        localStorage:
+          type: object
+          additionalProperties:
+            type: string
+        sessionStorage:
+          type: object
+          additionalProperties:
+            type: string
+
+    JobStatus:
+      type: object
+      properties:
+        jobId:
+          type: string
+        status:
+          type: string
+          enum: [waiting, active, completed, failed, delayed]
+        progress:
+          type: number
+        result:
+          type: object
+        error:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        processedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+        attemptsMade:
+          type: integer
+        attemptsTotal:
+          type: integer
+
+security:
+  - apiKey: []
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          description: Service healthy
+        '503':
+          description: Service degraded
+
+  /api/session/import:
+    post:
+      summary: Import Facebook session cookies
+      tags: [Session]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionImport'
+      responses:
+        '201':
+          description: Session imported
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponse'
+
+  /api/session/status:
+    get:
+      summary: Get session status
+      tags: [Session]
+      parameters:
+        - name: sessionName
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Session status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponse'
+
+  /api/session/refresh:
+    post:
+      summary: Refresh a session
+      tags: [Session]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - sessionName
+              properties:
+                sessionName:
+                  type: string
+      responses:
+        '200':
+          description: Session refreshed
+
+  /api/session/export:
+    get:
+      summary: Export session cookies
+      tags: [Session]
+      parameters:
+        - name: sessionName
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Session exported
+
+  /api/session/list:
+    get:
+      summary: List all sessions
+      tags: [Session]
+      responses:
+        '200':
+          description: List of session names
+
+  /api/scrape/posts:
+    post:
+      summary: Scrape posts from Facebook groups
+      tags: [Scrape]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - sessionName
+                - groups
+              properties:
+                sessionName:
+                  type: string
+                groups:
+                  type: array
+                  items:
+                    type: string
+                lastScrapeTimestamp:
+                  type: string
+                maxPosts:
+                  type: integer
+                scrollTimeout:
+                  type: integer
+                priority:
+                  type: integer
+      responses:
+        '202':
+          description: Job queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponse'
+
+  /api/scrape/members:
+    post:
+      summary: Scrape members from Facebook groups
+      tags: [Scrape]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - sessionName
+                - groups
+              properties:
+                sessionName:
+                  type: string
+                groups:
+                  type: array
+                  items:
+                    type: string
+                maxMembers:
+                  type: integer
+                scrollTimeout:
+                  type: integer
+                priority:
+                  type: integer
+      responses:
+        '202':
+          description: Job queued
+
+  /api/message/send:
+    post:
+      summary: Send a message to a Facebook user
+      tags: [Message]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - sessionName
+                - username
+                - message
+              properties:
+                sessionName:
+                  type: string
+                username:
+                  type: string
+                message:
+                  type: string
+                priority:
+                  type: integer
+      responses:
+        '202':
+          description: Job queued
+
+  /api/job/{jobId}:
+    get:
+      summary: Get job status
+      tags: [Jobs]
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Job status
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/JobStatus'
+
+  /api/queue/stats:
+    get:
+      summary: Get queue statistics
+      tags: [Jobs]
+      responses:
+        '200':
+          description: Queue stats

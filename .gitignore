@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+*.log
+/data
+docker-service/node_modules/
+docker-service/dist/
+shared-types/node_modules/
+shared-types/dist/
+n8n-node/node_modules/
+n8n-node/dist/
