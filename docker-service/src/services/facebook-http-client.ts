@@ -145,11 +145,19 @@ export class FacebookHttpClient {
     const setCookieHeader = headers['set-cookie'];
     if (!setCookieHeader) return;
 
+    // Never allow deletion of critical auth cookies — Facebook sometimes
+    // sends expired Set-Cookie headers for these during redirects/warm-up
+    const PROTECTED_COOKIES = new Set(['c_user', 'xs', 'fr', 'sb', 'datr']);
+
     const cookieStrings = Array.isArray(setCookieHeader) ? setCookieHeader : [setCookieHeader];
 
     for (const cookieStr of cookieStrings) {
       try {
-        const cookie = this.parseSetCookie(cookieStr, allowDeletion);
+        const nameMatch = cookieStr.match(/^([^=]+)=/);
+        const cookieName = nameMatch ? nameMatch[1].trim() : '';
+        const isProtected = PROTECTED_COOKIES.has(cookieName);
+
+        const cookie = this.parseSetCookie(cookieStr, allowDeletion && !isProtected);
         if (cookie && cookie.domain.includes('facebook.com')) {
           this.cookies.set(cookie.name, cookie);
           this.cookiesDirty = true;
