@@ -57,15 +57,15 @@ export class GroupMemberScraper {
     const groupName = this.extractGroupName(response.body);
     const maxMembers = input.maxMembers || 500;
 
-    // Parse initial HTML members
+    // Parse initial HTML members (only used as seed, not capped by maxMembers)
     const seenProfiles = new Set<string>();
-    const members = this.parseMembersFromHtml(response.body, groupName, maxMembers);
+    const members = this.parseMembersFromHtml(response.body, groupName);
     for (const m of members) {
       seenProfiles.add(m.profileName);
     }
     log.info({ groupName, initialMembers: members.length, maxMembers }, 'Initial page parsed');
 
-    // If we need more members, paginate via GraphQL
+    // Always paginate via GraphQL to get properly structured data (edge-level fields)
     if (members.length < maxMembers) {
       await this.paginateWithGraphQL(
         response.body,
@@ -333,30 +333,46 @@ export class GroupMemberScraper {
   private parseMembersFromHtml(
     html: string,
     groupName: string,
-    maxMembers: number,
   ): GroupMember[] {
     const members: GroupMember[] = [];
     const seenProfiles = new Set<string>();
 
-    // Strategy 1: Parse JSON from script tags and walk tree for member nodes
-    const jsonMembers = this.extractFromJsonScripts(html, groupName);
-    for (const member of jsonMembers) {
-      const key = member.profileUrl || member.profileName;
+    // Strategy 1: Extract from new_members edges directly (best data quality)
+    const edgeMembers = this.extractFromNewMembersEdges(html, groupName);
+    for (const member of edgeMembers) {
+      const key = member.profileName;
       if (seenProfiles.has(key)) continue;
       seenProfiles.add(key);
       members.push(member);
-      if (members.length >= maxMembers) break;
     }
 
-    // Strategy 2: Fallback - extract profile links from HTML
+    // Strategy 2: Parse JSON from script tags and walk tree for member nodes
+    const jsonMembers = this.extractFromJsonScripts(html, groupName);
+    for (const member of jsonMembers) {
+      const key = member.profileName;
+      if (seenProfiles.has(key)) {
+        // Replace existing if this one has more data
+        const existingIdx = members.findIndex(m => m.profileName === member.profileName);
+        if (existingIdx !== -1) {
+          const existing = members[existingIdx];
+          const existingScore = (existing.bio ? 1 : 0) + (existing.joinedDate ? 1 : 0) + (existing.location ? 1 : 0);
+          const newScore = (member.bio ? 1 : 0) + (member.joinedDate ? 1 : 0) + (member.location ? 1 : 0);
+          if (newScore > existingScore) members[existingIdx] = member;
+        }
+        continue;
+      }
+      seenProfiles.add(key);
+      members.push(member);
+    }
+
+    // Strategy 3: Fallback - extract profile links from HTML
     if (members.length === 0) {
       const htmlMembers = this.extractFromHtmlLinks(html, groupName);
       for (const member of htmlMembers) {
-        const key = member.profileUrl || member.profileName;
+        const key = member.profileName;
         if (seenProfiles.has(key)) continue;
         seenProfiles.add(key);
         members.push(member);
-        if (members.length >= maxMembers) break;
       }
     }
 
@@ -364,7 +380,68 @@ export class GroupMemberScraper {
   }
 
   // ==========================================
-  // Strategy 1: JSON tree walking
+  // Strategy 1: Extract from new_members edges (best data)
+  // ==========================================
+
+  private extractFromNewMembersEdges(html: string, groupName: string): GroupMember[] {
+    const members: GroupMember[] = [];
+    const seenNames = new Set<string>();
+
+    // Find the new_members JSON section in the HTML
+    const newMembersIdx = html.indexOf('"new_members"');
+    if (newMembersIdx === -1) return members;
+
+    // Find the edges array after new_members
+    const searchStart = newMembersIdx;
+    const edgesIdx = html.indexOf('"edges"', searchStart);
+    if (edgesIdx === -1 || edgesIdx - searchStart > 200) return members;
+
+    // Try to extract the edges array by finding its bounds
+    const arrayStart = html.indexOf('[', edgesIdx);
+    if (arrayStart === -1) return members;
+
+    // Parse edges by finding balanced brackets
+    let depth = 0;
+    let arrayEnd = -1;
+    for (let i = arrayStart; i < Math.min(html.length, arrayStart + 500000); i++) {
+      if (html[i] === '[') depth++;
+      else if (html[i] === ']') {
+        depth--;
+        if (depth === 0) { arrayEnd = i + 1; break; }
+      }
+    }
+
+    if (arrayEnd === -1) return members;
+
+    try {
+      const edgesJson = html.substring(arrayStart, arrayEnd);
+      const edges = JSON.parse(edgesJson);
+
+      if (!Array.isArray(edges)) return members;
+
+      for (const edge of edges) {
+        if (!edge || !edge.node || typeof edge.node !== 'object') continue;
+        const node = edge.node as Record<string, unknown>;
+        if (node.__typename !== 'User' || typeof node.name !== 'string') continue;
+
+        const member = this.tryExtractMember(node, groupName, edge);
+        if (member) {
+          if (!seenNames.has(member.profileName)) {
+            seenNames.add(member.profileName);
+            members.push(member);
+          }
+        }
+      }
+    } catch {
+      // JSON parse failed
+    }
+
+    log.debug({ count: members.length }, 'Members found via new_members edges');
+    return members;
+  }
+
+  // ==========================================
+  // Strategy 2: JSON tree walking
   // ==========================================
 
   private extractFromJsonScripts(html: string, groupName: string): GroupMember[] {
@@ -573,7 +650,7 @@ export class GroupMemberScraper {
   }
 
   // ==========================================
-  // Strategy 2: HTML link extraction
+  // Strategy 3: HTML link extraction
   // ==========================================
 
   private extractFromHtmlLinks(html: string, groupName: string): GroupMember[] {

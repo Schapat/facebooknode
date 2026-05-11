@@ -9,3 +9,4 @@ shared-types/node_modules/
 shared-types/dist/
 n8n-node/node_modules/
 n8n-node/dist/
+docker-service/test-member-response.ts
