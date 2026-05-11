@@ -37,10 +37,10 @@ const DEFAULT_HEADERS: Record<string, string> = {
 const MOBILE_USER_AGENT =
   'Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36';
 
-// Feature-phone UA: forces Facebook to serve the old basic HTML forms
-// instead of the React-based Messenger SPA
-const FEATURE_PHONE_USER_AGENT =
-  'Nokia6300/2.0 (05.00) Profile/MIDP-2.0 Configuration/CLDC-1.1';
+// Older but supported mobile Chrome UA — avoids both the Messenger SPA
+// (served to modern UAs) and the "unsupported device" block (for ancient UAs)
+const MBASIC_USER_AGENT =
+  'Mozilla/5.0 (Linux; Android 5.1.1; Nexus 5 Build/LMY48B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/53.0.2785.143 Mobile Safari/537.36';
 
 const MAX_REDIRECTS = 5;
 
@@ -111,6 +111,17 @@ export class FacebookHttpClient {
       hasCUser: this.cookies.has('c_user'),
       hasXs: this.cookies.has('xs'),
     };
+  }
+
+  /**
+   * Make a request with a custom User-Agent (for diagnose/testing).
+   */
+  async requestWithUA(
+    url: string,
+    userAgent: string,
+    options: { referer?: string } = {},
+  ): Promise<HttpResponse> {
+    return this.request(url, { ...options, overrideUA: userAgent });
   }
 
   /**
@@ -273,7 +284,7 @@ export class FacebookHttpClient {
    */
   async request(
     url: string,
-    options: { referer?: string; timeout?: number } = {},
+    options: { referer?: string; timeout?: number; overrideUA?: string } = {},
   ): Promise<HttpResponse> {
     return this.requestWithMethod('GET', url, options);
   }
@@ -292,7 +303,7 @@ export class FacebookHttpClient {
   private async requestWithMethod(
     method: string,
     url: string,
-    options: { referer?: string; timeout?: number; body?: string; contentType?: string } = {},
+    options: { referer?: string; timeout?: number; body?: string; contentType?: string; overrideUA?: string } = {},
   ): Promise<HttpResponse> {
     let currentUrl = url;
     let redirectCount = 0;
@@ -335,7 +346,7 @@ export class FacebookHttpClient {
   private rawRequest(
     url: string,
     method: string,
-    options: { referer?: string; timeout?: number; body?: string; contentType?: string },
+    options: { referer?: string; timeout?: number; body?: string; contentType?: string; overrideUA?: string },
   ): Promise<HttpResponse> {
     return new Promise((resolve, reject) => {
       const urlObj = new URL(url);
@@ -343,28 +354,21 @@ export class FacebookHttpClient {
       const isHttps = urlObj.protocol === 'https:';
       const postBody = options.body ? Buffer.from(options.body, 'utf-8') : null;
 
-      // Use feature-phone UA for mbasic/0.facebook.com to force basic HTML rendering
+      // Use older mobile UA for mbasic/0.facebook.com to get basic HTML rendering
       const isMbasic = urlObj.hostname.includes('mbasic.facebook.com') || urlObj.hostname.includes('0.facebook.com');
+      const effectiveUA = options.overrideUA || (isMbasic ? MBASIC_USER_AGENT : this.userAgent);
       const headers: Record<string, string> = {
         ...DEFAULT_HEADERS,
-        'User-Agent': isMbasic ? FEATURE_PHONE_USER_AGENT : this.userAgent,
+        'User-Agent': effectiveUA,
         Cookie: this.buildCookieString(),
         Referer: options.referer || 'https://www.facebook.com/',
       };
 
-      // Strip desktop-specific client hints and modern headers for mbasic/0.facebook.com
+      // Strip modern desktop-specific headers for mbasic/0.facebook.com
       if (isMbasic) {
         delete headers['sec-ch-ua'];
         delete headers['sec-ch-ua-mobile'];
         delete headers['sec-ch-ua-platform'];
-        delete headers['Sec-Fetch-Dest'];
-        delete headers['Sec-Fetch-Mode'];
-        delete headers['Sec-Fetch-Site'];
-        delete headers['Sec-Fetch-User'];
-        delete headers['Upgrade-Insecure-Requests'];
-        delete headers['Cache-Control'];
-        // Feature phones only accept basic content
-        headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8';
       }
 
       if (postBody) {

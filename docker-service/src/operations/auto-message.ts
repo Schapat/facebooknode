@@ -42,54 +42,45 @@ export class AutoMessage {
     results.myUserId = myUserId;
     results.cookieDebug = this.httpClient.getCookieDebugInfo();
 
-    const urls = [
-      `https://mbasic.facebook.com/messages/compose/?ids=${recipientId}`,
-      `https://mbasic.facebook.com/messages/thread/${recipientId}/`,
-      `https://mbasic.facebook.com/messages/read/?tid=cid.c.${recipientId}%3A${myUserId}`,
-      `https://0.facebook.com/messages/compose/?ids=${recipientId}`,
-      `https://0.facebook.com/messages/thread/${recipientId}/`,
-    ];
+    // Test multiple User-Agents against the compose URL to find one that works
+    const testUrl = `https://mbasic.facebook.com/messages/compose/?ids=${recipientId}`;
+    const userAgents: Record<string, string> = {
+      'chrome53-android5': 'Mozilla/5.0 (Linux; Android 5.1.1; Nexus 5 Build/LMY48B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/53.0.2785.143 Mobile Safari/537.36',
+      'chrome83-android10': 'Mozilla/5.0 (Linux; Android 10; SM-A205U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.106 Mobile Safari/537.36',
+      'firefox41-android': 'Mozilla/5.0 (Android 4.4; Mobile; rv:41.0) Gecko/41.0 Firefox/41.0',
+      'operamini': 'Opera/9.80 (Android; Opera Mini/36.2.2254/119.132; U; en) Presto/2.12.423 Version/12.16',
+      'kaios': 'Mozilla/5.0 (Mobile; LYF/F90M/LYF-F90M-000-02-28-130718; Android; rv:48.0) Gecko/48.0 Firefox/48.0 KAIOS/2.0',
+      'ucbrowser': 'Mozilla/5.0 (Linux; U; Android 4.4.4; en-US; XT1022 Build/KXC21.5-40) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 UCBrowser/11.0.0.828 U3/0.8.0 Mobile Safari/534.30',
+      'android-stock': 'Mozilla/5.0 (Linux; U; Android 4.4.2; en-us; SCH-I535 Build/KOT49H) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
+    };
 
-    for (const url of urls) {
+    for (const [name, ua] of Object.entries(userAgents)) {
       try {
-        const page = await this.httpClient.request(url, {
+        const page = await this.httpClient.requestWithUA(testUrl, ua, {
           referer: 'https://mbasic.facebook.com/messages/',
         });
 
-        const allForms = (page.body.match(/<form[^>]*>/gi) || []).map((f: string) => f.substring(0, 300));
         const hasBodyField = page.body.includes('name="body"') || page.body.includes('name="message_body"');
         const hasTextarea = /<textarea/i.test(page.body);
+        const hasUnsupported = page.body.includes('unsupported-interstitial');
         const isLogin = this.httpClient.isLoginPage(page.body);
         const foundFormAction = this.findPostForm(page.body);
         const titleMatch = page.body.match(/<title>([^<]*)<\/title>/i);
 
-        // Extract the actual page content (skip CSS/head, show body)
-        const bodyTagStart = page.body.indexOf('<body');
-        const contentStart = bodyTagStart > 0 ? bodyTagStart : 0;
-        // Also extract text content (strip tags) for readable error messages
-        const textContent = page.body
-          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-          .replace(/<[^>]+>/g, ' ')
-          .replace(/\s+/g, ' ')
-          .trim()
-          .substring(0, 1000);
-
-        results[url] = {
+        results[name] = {
+          ua: ua.substring(0, 60) + '...',
           statusCode: page.statusCode,
           bodyLength: page.body.length,
           isLoginPage: isLogin,
           title: titleMatch ? titleMatch[1] : null,
-          formsFound: allForms.length,
-          forms: allForms,
           hasBodyField,
           hasTextarea,
+          hasUnsupported,
           detectedFormAction: foundFormAction,
-          bodyContent: page.body.substring(contentStart, contentStart + 4000),
-          textContent,
+          hasMessagingForm: !!(hasBodyField || hasTextarea || (foundFormAction && foundFormAction.includes('/messages/'))),
         };
       } catch (error) {
-        results[url] = { error: error instanceof Error ? error.message : String(error) };
+        results[name] = { ua: ua.substring(0, 60) + '...', error: error instanceof Error ? error.message : String(error) };
       }
     }
 
