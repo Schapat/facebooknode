@@ -150,7 +150,7 @@ export async function createApp(deps: AppDependencies): Promise<FastifyInstance>
 
       registerSessionRoutes(protectedApp, deps.sessionManager);
       registerScrapeRoutes(protectedApp, deps.queueManager);
-      registerMessageRoutes(protectedApp, deps.queueManager);
+      registerMessageRoutes(protectedApp, deps.queueManager, deps.sessionManager);
       registerJobRoutes(protectedApp, deps.queueManager);
     },
     { prefix: '/api' },

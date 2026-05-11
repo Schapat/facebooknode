@@ -1,6 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { QueueManager } from '../queue/queue-manager';
+import { AutoMessage } from '../operations/auto-message';
+import { SessionManager } from '../services/session-manager';
 import { createChildLogger } from '../utils/logger';
 
 const log = createChildLogger({ service: 'MessageRoutes' });
@@ -12,9 +14,15 @@ const messageSchema = z.object({
   priority: z.number().optional(),
 });
 
+const diagnoseSchema = z.object({
+  sessionName: z.string().min(1),
+  recipientId: z.string().min(1),
+});
+
 export function registerMessageRoutes(
   app: FastifyInstance,
   queueManager: QueueManager,
+  sessionManager: SessionManager,
 ): void {
   app.post('/message/send', {
     schema: {
@@ -49,6 +57,41 @@ export function registerMessageRoutes(
         jobId,
         timestamp: new Date().toISOString(),
       });
+    },
+  });
+
+  app.post('/message/diagnose', {
+    schema: {
+      description: 'Debug: inspect what mbasic/mobile compose pages return for a recipient',
+      tags: ['Message'],
+      body: {
+        type: 'object',
+        required: ['sessionName', 'recipientId'],
+        properties: {
+          sessionName: { type: 'string' },
+          recipientId: { type: 'string' },
+        },
+      },
+    },
+    handler: async (request, reply) => {
+      const body = diagnoseSchema.parse(request.body);
+      const autoMessage = new AutoMessage(sessionManager);
+
+      try {
+        const result = await autoMessage.diagnose(body.sessionName, body.recipientId);
+        return reply.status(200).send({
+          success: true,
+          data: result,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        log.error({ error }, 'Diagnosis failed');
+        return reply.status(500).send({
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error',
+          timestamp: new Date().toISOString(),
+        });
+      }
     },
   });
 }

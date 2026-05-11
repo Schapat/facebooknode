@@ -23,6 +23,64 @@ export class AutoMessage {
     }
   }
 
+  /**
+   * Diagnostic method: loads mbasic compose page for a recipientId and returns
+   * raw page details (forms found, body snippet, status) for debugging.
+   */
+  async diagnose(sessionName: string, recipientId: string): Promise<Record<string, unknown>> {
+    await this.httpClient.initSession(sessionName);
+    try {
+      return await this.runDiagnosis(recipientId);
+    } finally {
+      await this.httpClient.persistCookies();
+    }
+  }
+
+  private async runDiagnosis(recipientId: string): Promise<Record<string, unknown>> {
+    const results: Record<string, unknown> = {};
+    const myUserId = this.httpClient.getUserId();
+    results.myUserId = myUserId;
+
+    const urls = [
+      `https://mbasic.facebook.com/messages/compose/?ids=${recipientId}`,
+      `https://mbasic.facebook.com/messages/thread/${recipientId}/`,
+      `https://mbasic.facebook.com/messages/read/?tid=cid.c.${recipientId}%3A${myUserId}`,
+      `https://m.facebook.com/messages/compose/?ids=${recipientId}`,
+    ];
+
+    for (const url of urls) {
+      try {
+        const page = await this.httpClient.request(url, {
+          referer: 'https://mbasic.facebook.com/messages/',
+        });
+
+        const allForms = (page.body.match(/<form[^>]*>/gi) || []).map((f: string) => f.substring(0, 300));
+        const hasBodyField = page.body.includes('name="body"') || page.body.includes('name="message_body"');
+        const hasTextarea = /<textarea/i.test(page.body);
+        const isLogin = this.httpClient.isLoginPage(page.body);
+        const foundFormAction = this.findPostForm(page.body);
+        const titleMatch = page.body.match(/<title>([^<]*)<\/title>/i);
+
+        results[url] = {
+          statusCode: page.statusCode,
+          bodyLength: page.body.length,
+          isLoginPage: isLogin,
+          title: titleMatch ? titleMatch[1] : null,
+          formsFound: allForms.length,
+          forms: allForms,
+          hasBodyField,
+          hasTextarea,
+          detectedFormAction: foundFormAction,
+          bodySnippet: page.body.substring(0, 4000),
+        };
+      } catch (error) {
+        results[url] = { error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+
+    return results;
+  }
+
   private async sendMessage(input: AutoMessageInput): Promise<MessageResult> {
     const { username, message } = input;
 
@@ -42,8 +100,8 @@ export class AutoMessage {
 
       await randomDelay(1000, 2000);
 
-      // Step 3: Send the message (mbasic first, then GraphQL/legacy fallbacks)
-      await this.sendViaMessaging(recipientId, myUserId, message, tokens);
+      // Step 3: Send the message (mbasic first, then m.facebook.com fallback)
+      await this.sendViaMessaging(recipientId, message);
 
       const sentAt = new Date().toISOString();
       log.info({ username, recipientId, sentAt }, 'Message sent successfully');
@@ -470,9 +528,7 @@ export class AutoMessage {
 
   private async sendViaMessaging(
     recipientId: string,
-    myUserId: string,
     message: string,
-    tokens: { fbDtsg: string; jazoest: string; lsd: string },
   ): Promise<void> {
     const errors: string[] = [];
 
@@ -492,22 +548,8 @@ export class AutoMessage {
       return;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      log.warn({ error: msg }, 'Mobile site send failed, trying next strategy');
+      log.warn({ error: msg }, 'Mobile site send failed');
       errors.push(`mobile: ${msg}`);
-    }
-
-    if (!tokens.fbDtsg) {
-      throw new MessageSendError(`All message send strategies failed (no fb_dtsg for API calls): ${errors.join('; ')}`);
-    }
-
-    // Strategy 3: GraphQL API (doc_id extracted dynamically)
-    try {
-      await this.sendViaGraphQL(recipientId, myUserId, message, tokens);
-      return;
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      log.warn({ error: msg }, 'GraphQL send failed');
-      errors.push(`graphql: ${msg}`);
     }
 
     throw new MessageSendError(`All message send strategies failed: ${errors.join('; ')}`);
@@ -714,152 +756,5 @@ export class AutoMessage {
     }
 
     log.info('Message sent via mobile/mbasic form submit');
-  }
-
-  private async sendViaGraphQL(
-    recipientId: string,
-    myUserId: string,
-    message: string,
-    tokens: { fbDtsg: string; jazoest: string; lsd: string },
-  ): Promise<void> {
-    log.info({ recipientId }, 'Sending message via GraphQL API');
-
-    // Extract doc_id dynamically from the Messenger page JS bundles
-    const docIds = await this.extractSendMessageDocIds(recipientId);
-
-    if (docIds.length === 0) {
-      throw new MessageSendError('Could not find any send message doc_id from Messenger page');
-    }
-
-    // Try each doc_id until one works
-    let lastError = '';
-    for (const docId of docIds) {
-      try {
-        await this.trySendGraphQL(recipientId, myUserId, message, tokens, docId);
-        return;
-      } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error);
-        if (lastError.includes('was not found')) {
-          log.debug({ docId }, 'doc_id not found, trying next');
-          continue;
-        }
-        throw error; // Re-throw non-doc_id errors (auth failures etc.)
-      }
-    }
-
-    throw new MessageSendError(`GraphQL: all doc_ids failed. Last error: ${lastError}`);
-  }
-
-  private async extractSendMessageDocIds(recipientId: string): Promise<string[]> {
-    const docIds: string[] = [];
-
-    try {
-      const messengerPage = await this.httpClient.request(
-        `https://www.facebook.com/messages/t/${recipientId}`,
-        { referer: 'https://www.facebook.com/messages/' },
-      );
-
-      // Look for send-related mutation doc_ids in various formats
-      const patterns = [
-        // Near useSendMessageMutation
-        /useSendMessageMutation[^}]{0,1000}?"(?:id|doc_id)"\s*:\s*"(\d{10,})"/g,
-        /"(?:id|doc_id)"\s*:\s*"(\d{10,})"[^}]{0,1000}?useSendMessageMutation/g,
-        // Near LSPlatformGraphQLLightspeedRequestForIGDQuery or similar send names
-        /[Ss]end[Mm]essage[^}]{0,500}?"(?:id|doc_id)"\s*:\s*"(\d{10,})"/g,
-        // Generic: e.preloader...queries with "send" nearby
-        /"preloader"[^}]{0,200}?"(?:id|doc_id)"\s*:\s*"(\d{10,})"/g,
-      ];
-
-      const seen = new Set<string>();
-      for (const pattern of patterns) {
-        let m;
-        while ((m = pattern.exec(messengerPage.body)) !== null) {
-          if (!seen.has(m[1])) {
-            seen.add(m[1]);
-            docIds.push(m[1]);
-          }
-        }
-      }
-
-      if (docIds.length > 0) {
-        log.info({ docIds }, 'Extracted send message doc_ids from Messenger page');
-      } else {
-        log.warn('No send message doc_ids found in Messenger page');
-      }
-    } catch (error) {
-      log.debug({ error }, 'Could not load Messenger page for doc_id extraction');
-    }
-
-    return docIds;
-  }
-
-  private async trySendGraphQL(
-    recipientId: string,
-    myUserId: string,
-    message: string,
-    tokens: { fbDtsg: string; jazoest: string; lsd: string },
-    docId: string,
-  ): Promise<void> {
-    log.debug({ recipientId, docId }, 'Trying GraphQL send with doc_id');
-
-    const variables = JSON.stringify({
-      input: {
-        message: { text: message },
-        otherUserFbId: recipientId,
-        source: 'messenger:web',
-        initiatingSource: 'messenger:send_message',
-      },
-    });
-
-    const params = new URLSearchParams({
-      fb_dtsg: tokens.fbDtsg,
-      jazoest: tokens.jazoest,
-      lsd: tokens.lsd,
-      fb_api_caller_class: 'RelayModern',
-      fb_api_req_friendly_name: 'useSendMessageMutation',
-      variables,
-      doc_id: docId,
-      __user: myUserId,
-      __a: '1',
-      __comet_req: '15',
-    });
-
-    const response = await this.httpClient.post(
-      'https://www.facebook.com/api/graphql/',
-      params.toString(),
-      { referer: 'https://www.facebook.com/messages/t/' + recipientId },
-    );
-
-    const body = response.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
-    log.debug({ statusCode: response.statusCode, bodySnippet: body.substring(0, 500) }, 'GraphQL send response');
-
-    if (response.statusCode !== 200) {
-      throw new MessageSendError(`GraphQL returned HTTP ${response.statusCode}`);
-    }
-
-    // Check for errors in response — Facebook returns multi-line JSON
-    for (const line of body.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('{')) continue;
-      try {
-        const data = JSON.parse(trimmed);
-        if (data.error === 1357001 || data.errorSummary) {
-          throw new MessageSendError('GraphQL: session not authenticated');
-        }
-        if (data.errors && data.errors.length > 0) {
-          const errMsg = data.errors[0]?.message || JSON.stringify(data.errors);
-          throw new MessageSendError(`GraphQL error: ${errMsg}`);
-        }
-      } catch (e) {
-        if (e instanceof MessageSendError) throw e;
-      }
-    }
-
-    // Check if response contains "was not found" (wrong doc_id)
-    if (body.includes('was not found')) {
-      throw new MessageSendError(`GraphQL document with ID ${docId} was not found`);
-    }
-
-    log.info({ recipientId, docId }, 'Message sent via GraphQL');
   }
 }
