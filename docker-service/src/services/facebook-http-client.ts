@@ -37,6 +37,11 @@ const DEFAULT_HEADERS: Record<string, string> = {
 const MOBILE_USER_AGENT =
   'Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36';
 
+// Feature-phone UA: forces Facebook to serve the old basic HTML forms
+// instead of the React-based Messenger SPA
+const FEATURE_PHONE_USER_AGENT =
+  'Nokia6300/2.0 (05.00) Profile/MIDP-2.0 Configuration/CLDC-1.1';
+
 const MAX_REDIRECTS = 5;
 
 export class FacebookHttpClient {
@@ -338,20 +343,28 @@ export class FacebookHttpClient {
       const isHttps = urlObj.protocol === 'https:';
       const postBody = options.body ? Buffer.from(options.body, 'utf-8') : null;
 
-      // Use mobile UA for mbasic.facebook.com (required to avoid "unsupported browser" block)
-      const isMbasic = urlObj.hostname.includes('mbasic.facebook.com');
+      // Use feature-phone UA for mbasic/0.facebook.com to force basic HTML rendering
+      const isMbasic = urlObj.hostname.includes('mbasic.facebook.com') || urlObj.hostname.includes('0.facebook.com');
       const headers: Record<string, string> = {
         ...DEFAULT_HEADERS,
-        'User-Agent': isMbasic ? MOBILE_USER_AGENT : this.userAgent,
+        'User-Agent': isMbasic ? FEATURE_PHONE_USER_AGENT : this.userAgent,
         Cookie: this.buildCookieString(),
         Referer: options.referer || 'https://www.facebook.com/',
       };
 
-      // Strip desktop-specific client hints for mbasic (inconsistent with mobile UA)
+      // Strip desktop-specific client hints and modern headers for mbasic/0.facebook.com
       if (isMbasic) {
         delete headers['sec-ch-ua'];
         delete headers['sec-ch-ua-mobile'];
         delete headers['sec-ch-ua-platform'];
+        delete headers['Sec-Fetch-Dest'];
+        delete headers['Sec-Fetch-Mode'];
+        delete headers['Sec-Fetch-Site'];
+        delete headers['Sec-Fetch-User'];
+        delete headers['Upgrade-Insecure-Requests'];
+        delete headers['Cache-Control'];
+        // Feature phones only accept basic content
+        headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8';
       }
 
       if (postBody) {
@@ -359,12 +372,8 @@ export class FacebookHttpClient {
         headers['Content-Length'] = String(postBody.length);
 
         if (isMbasic) {
-          // mbasic form submissions use navigate mode, not AJAX/cors
-          headers['Sec-Fetch-Dest'] = 'document';
-          headers['Sec-Fetch-Mode'] = 'navigate';
-          headers['Sec-Fetch-Site'] = 'same-origin';
-          headers['Sec-Fetch-User'] = '?1';
-          headers['Origin'] = 'https://mbasic.facebook.com';
+          // Feature phone POST: minimal headers, no Sec-Fetch
+          headers['Origin'] = `https://${urlObj.hostname}`;
         } else {
           // AJAX/API requests
           headers['Sec-Fetch-Dest'] = 'empty';

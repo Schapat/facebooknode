@@ -46,7 +46,8 @@ export class AutoMessage {
       `https://mbasic.facebook.com/messages/compose/?ids=${recipientId}`,
       `https://mbasic.facebook.com/messages/thread/${recipientId}/`,
       `https://mbasic.facebook.com/messages/read/?tid=cid.c.${recipientId}%3A${myUserId}`,
-      `https://m.facebook.com/messages/compose/?ids=${recipientId}`,
+      `https://0.facebook.com/messages/compose/?ids=${recipientId}`,
+      `https://0.facebook.com/messages/thread/${recipientId}/`,
     ];
 
     for (const url of urls) {
@@ -600,10 +601,12 @@ export class AutoMessage {
   private async sendViaMbasic(recipientId: string, message: string): Promise<void> {
     log.info({ recipientId }, 'Sending message via mbasic.facebook.com');
 
-    // Try multiple mbasic URLs in order
+    // Try multiple mbasic and 0.facebook.com URLs in order
     const mbasicUrls = [
       `https://mbasic.facebook.com/messages/compose/?ids=${recipientId}`,
+      `https://0.facebook.com/messages/compose/?ids=${recipientId}`,
       `https://mbasic.facebook.com/messages/thread/${recipientId}/`,
+      `https://0.facebook.com/messages/thread/${recipientId}/`,
       `https://mbasic.facebook.com/messages/read/?tid=cid.c.${recipientId}%3A${this.httpClient.getUserId()}`,
     ];
 
