@@ -30,8 +30,8 @@ export class AutoMessage {
 
     try {
       // Step 1: Get fb_dtsg and other tokens from Facebook
-      const homeResponse = await this.httpClient.request('https://www.facebook.com/');
-      const tokens = this.httpClient.extractTokens(homeResponse.body);
+      // Try multiple pages - homepage may return 400
+      const tokens = await this.extractTokens(username);
 
       if (!tokens.fbDtsg) {
         throw new MessageSendError('Could not extract fb_dtsg token - session may be expired');
@@ -47,7 +47,7 @@ export class AutoMessage {
 
       await randomDelay(1000, 2000);
 
-      // Step 3: Send the message via /messaging/send/
+      // Step 3: Send the message
       await this.sendViaMessaging(recipientId, myUserId, message, tokens);
 
       const sentAt = new Date().toISOString();
@@ -67,6 +67,46 @@ export class AutoMessage {
         error: error instanceof Error ? error.message : 'Unknown error',
       };
     }
+  }
+
+  private async extractTokens(
+    username: string,
+  ): Promise<{ fbDtsg: string; jazoest: string; lsd: string }> {
+    // Try the target profile page first (if username is a URL) - gets tokens + helps with resolution
+    if (username.startsWith('http')) {
+      try {
+        const response = await this.httpClient.request(username);
+        const tokens = this.httpClient.extractTokens(response.body);
+        if (tokens.fbDtsg) {
+          log.debug('Extracted tokens from profile page');
+          return tokens;
+        }
+      } catch (error) {
+        log.warn({ error }, 'Failed to load profile page for tokens');
+      }
+    }
+
+    // Try multiple pages to get tokens
+    const urls = [
+      'https://www.facebook.com/',
+      'https://www.facebook.com/me',
+      'https://www.facebook.com/messages/',
+    ];
+
+    for (const url of urls) {
+      try {
+        const response = await this.httpClient.request(url);
+        const tokens = this.httpClient.extractTokens(response.body);
+        if (tokens.fbDtsg) {
+          log.debug({ url }, 'Extracted tokens from page');
+          return tokens;
+        }
+      } catch (error) {
+        log.warn({ error, url }, 'Failed to load page for tokens');
+      }
+    }
+
+    return { fbDtsg: '', jazoest: '', lsd: '' };
   }
 
   private async resolveUserId(
@@ -305,7 +345,17 @@ export class AutoMessage {
   ): Promise<void> {
     const errors: string[] = [];
 
-    // Strategy 1: mbasic.facebook.com HTML form (most reliable)
+    // Strategy 1: Legacy /messaging/send/ endpoint (most reliable with valid tokens)
+    try {
+      await this.sendViaLegacyEndpoint(recipientId, myUserId, message, tokens);
+      return;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      log.warn({ error: msg }, 'Legacy send failed, trying next strategy');
+      errors.push(`legacy: ${msg}`);
+    }
+
+    // Strategy 2: mbasic.facebook.com HTML form
     try {
       await this.sendViaMbasic(recipientId, message);
       return;
@@ -315,14 +365,14 @@ export class AutoMessage {
       errors.push(`mbasic: ${msg}`);
     }
 
-    // Strategy 2: Legacy /messaging/send/ endpoint
+    // Strategy 3: m.facebook.com mobile compose
     try {
-      await this.sendViaLegacyEndpoint(recipientId, myUserId, message, tokens);
+      await this.sendViaMobile(recipientId, message);
       return;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      log.warn({ error: msg }, 'Legacy send failed');
-      errors.push(`legacy: ${msg}`);
+      log.warn({ error: msg }, 'Mobile send failed');
+      errors.push(`mobile: ${msg}`);
     }
 
     throw new MessageSendError(`All message send strategies failed: ${errors.join('; ')}`);
@@ -414,15 +464,19 @@ export class AutoMessage {
     params.append('message_batch[0][specific_to_list][0]', otherUserId);
     params.append('message_batch[0][specific_to_list][1]', selfId);
     params.append('message_batch[0][timestamp]', String(timestamp));
+    params.append('__user', myUserId);
     params.append('__a', '1');
+
+    log.debug({ recipientId, myUserId }, 'Sending via /messaging/send/');
 
     const response = await this.httpClient.post(
       'https://www.facebook.com/messaging/send/',
       params.toString(),
-      { referer: 'https://www.facebook.com/messages/' },
+      { referer: 'https://www.facebook.com/messages/t/' + recipientId },
     );
 
     if (response.statusCode !== 200) {
+      log.debug({ statusCode: response.statusCode, bodySnippet: response.body.substring(0, 500) }, 'messaging/send response');
       throw new MessageSendError(`HTTP ${response.statusCode} from messaging endpoint`);
     }
 
@@ -442,5 +496,89 @@ export class AutoMessage {
     }
 
     log.info({ recipientId }, 'Message sent via /messaging/send/');
+  }
+
+  private async sendViaMobile(recipientId: string, message: string): Promise<void> {
+    // Try m.facebook.com (regular mobile site, not mbasic) for messaging
+    const composeUrl = `https://m.facebook.com/messages/compose/?ids=${recipientId}`;
+    log.info({ recipientId }, 'Trying m.facebook.com message send');
+
+    const page = await this.httpClient.request(composeUrl, {
+      referer: 'https://m.facebook.com/',
+    });
+
+    if (this.httpClient.isLoginPage(page.body)) {
+      throw new MessageSendError('Session not valid on m.facebook.com (login page)');
+    }
+
+    // Look for any form that posts to a messaging endpoint
+    const formMatch =
+      page.body.match(/<form[^>]*action="(\/messages\/[^"]*)"[^>]*method="post"/i) ||
+      page.body.match(/<form[^>]*method="post"[^>]*action="(\/messages\/[^"]*)"/i);
+
+    if (!formMatch) {
+      // Try the thread URL format instead
+      const threadUrl = `https://m.facebook.com/messages/read/?tid=cid.c.${recipientId}%3A${this.httpClient.getUserId()}`;
+      const threadPage = await this.httpClient.request(threadUrl, {
+        referer: 'https://m.facebook.com/messages/',
+      });
+
+      const threadFormMatch =
+        threadPage.body.match(/<form[^>]*action="(\/messages\/[^"]*)"[^>]*method="post"/i) ||
+        threadPage.body.match(/<form[^>]*method="post"[^>]*action="(\/messages\/[^"]*)"/i);
+
+      if (!threadFormMatch) {
+        throw new MessageSendError('No message form found on m.facebook.com');
+      }
+
+      await this.submitMobileForm(threadPage.body, threadFormMatch[1], message, threadUrl, 'm.facebook.com');
+      return;
+    }
+
+    await this.submitMobileForm(page.body, formMatch[1], message, composeUrl, 'm.facebook.com');
+  }
+
+  private async submitMobileForm(
+    html: string,
+    formActionRaw: string,
+    message: string,
+    referer: string,
+    domain: string,
+  ): Promise<void> {
+    let formAction = formActionRaw.replace(/&amp;/g, '&');
+    if (!formAction.startsWith('http')) {
+      formAction = `https://${domain}${formAction}`;
+    }
+
+    const params = new URLSearchParams();
+    const hiddenRegex = /<input[^>]*type="hidden"[^>]*/gi;
+    let match;
+    while ((match = hiddenRegex.exec(html)) !== null) {
+      const tag = match[0];
+      const nameMatch = tag.match(/name="([^"]*)"/);
+      const valueMatch = tag.match(/value="([^"]*)"/);
+      if (nameMatch) {
+        params.append(
+          nameMatch[1].replace(/&amp;/g, '&'),
+          valueMatch ? valueMatch[1].replace(/&amp;/g, '&') : '',
+        );
+      }
+    }
+
+    params.append('body', message);
+    const submitMatch = html.match(/<input[^>]*name="send"[^>]*value="([^"]*)"/i);
+    params.append('send', submitMatch ? submitMatch[1] : 'Senden');
+
+    log.debug({ formAction }, `Submitting ${domain} message form`);
+
+    const response = await this.httpClient.post(formAction, params.toString(), {
+      referer,
+    });
+
+    if (response.statusCode >= 400) {
+      throw new MessageSendError(`${domain} send returned HTTP ${response.statusCode}`);
+    }
+
+    log.info(`Message sent via ${domain}`);
   }
 }

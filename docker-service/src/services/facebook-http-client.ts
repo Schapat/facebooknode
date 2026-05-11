@@ -314,16 +314,38 @@ export class FacebookHttpClient {
         Referer: options.referer || 'https://www.facebook.com/',
       };
 
+      // Strip desktop-specific client hints for mbasic (inconsistent with mobile UA)
+      if (isMbasic) {
+        delete headers['sec-ch-ua'];
+        delete headers['sec-ch-ua-mobile'];
+        delete headers['sec-ch-ua-platform'];
+      }
+
       if (postBody) {
         headers['Content-Type'] = options.contentType || 'application/x-www-form-urlencoded';
         headers['Content-Length'] = String(postBody.length);
-        // GraphQL requests need different Sec-Fetch headers
-        headers['Sec-Fetch-Dest'] = 'empty';
-        headers['Sec-Fetch-Mode'] = 'cors';
-        headers['Sec-Fetch-Site'] = 'same-origin';
-        headers['X-FB-Friendly-Name'] = 'GroupsCometFeedRegularStoriesPaginationQuery';
-        delete headers['Upgrade-Insecure-Requests'];
-        delete headers['Sec-Fetch-User'];
+
+        if (isMbasic) {
+          // mbasic form submissions use navigate mode, not AJAX/cors
+          headers['Sec-Fetch-Dest'] = 'document';
+          headers['Sec-Fetch-Mode'] = 'navigate';
+          headers['Sec-Fetch-Site'] = 'same-origin';
+          headers['Sec-Fetch-User'] = '?1';
+          headers['Origin'] = 'https://mbasic.facebook.com';
+        } else {
+          // AJAX/API requests
+          headers['Sec-Fetch-Dest'] = 'empty';
+          headers['Sec-Fetch-Mode'] = 'cors';
+          headers['Sec-Fetch-Site'] = 'same-origin';
+          headers['Origin'] = `https://${urlObj.hostname}`;
+          delete headers['Upgrade-Insecure-Requests'];
+          delete headers['Sec-Fetch-User'];
+
+          // Only set GraphQL-specific header for GraphQL endpoints
+          if (urlObj.pathname.includes('/api/graphql')) {
+            headers['X-FB-Friendly-Name'] = 'GroupsCometFeedRegularStoriesPaginationQuery';
+          }
+        }
       }
 
       const requestOptions = {
@@ -384,8 +406,8 @@ export class FacebookHttpClient {
 
   isLoginPage(html: string): boolean {
     return (
-      html.includes('/login/') ||
       html.includes('login_form') ||
+      html.includes('action="/login') ||
       html.includes('"loggedIn":false') ||
       (html.includes('checkpoint') && html.length < 5000)
     );
