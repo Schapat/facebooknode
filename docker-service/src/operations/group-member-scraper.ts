@@ -402,6 +402,7 @@ export class GroupMemberScraper {
     seenNames: Set<string>,
     groupName: string,
     depth: number,
+    parent?: Record<string, unknown>,
   ): void {
     if (depth > 40 || !obj) return;
 
@@ -427,65 +428,125 @@ export class GroupMemberScraper {
 
     const record = obj as Record<string, unknown>;
 
-    // Check if this looks like a User node with name + URL
-    const member = this.tryExtractMember(record, groupName);
-    if (member) {
-      // Dedup by profileName only - prefer entries that have a URL
-      if (seenNames.has(member.profileName)) {
-        // If this one has a URL and the existing one doesn't, replace it
-        if (member.profileUrl) {
-          const existingIdx = members.findIndex(m => m.profileName === member.profileName && !m.profileUrl);
-          if (existingIdx !== -1) {
-            members[existingIdx] = member;
-          }
+    // Check if this is an edge object with a "node" containing a User
+    // Facebook GraphQL structure: edge = { node: { __typename: "User", name, url }, subtitle: {...}, join_status_text: {...}, ... }
+    if (record.node && typeof record.node === 'object') {
+      const node = record.node as Record<string, unknown>;
+      if ((node.__typename === 'User' || node.__typename === 'GroupMember') && typeof node.name === 'string') {
+        const member = this.tryExtractMember(node, groupName, record);
+        if (member) {
+          this.addMemberDeduped(member, members, seenNames);
+          // Don't return - continue walking for nested members
         }
-      } else {
-        seenNames.add(member.profileName);
-        members.push(member);
       }
     }
 
-    // Continue walking
+    // Also check if this record itself is a User node (for initial HTML data)
+    if ((record.__typename === 'User' || record.__typename === 'GroupMember') && typeof record.name === 'string') {
+      const member = this.tryExtractMember(record, groupName, parent);
+      if (member) {
+        this.addMemberDeduped(member, members, seenNames);
+      }
+    }
+
+    // Continue walking - pass current record as parent context
     for (const value of Object.values(record)) {
-      this.walkJsonForMembers(value, members, seenNames, groupName, depth + 1);
+      this.walkJsonForMembers(value, members, seenNames, groupName, depth + 1, record);
     }
   }
 
-  private tryExtractMember(obj: Record<string, unknown>, groupName: string): GroupMember | null {
-    // A member node should be a User-typed object with name + URL
-    const typename = obj.__typename;
-    if (typename !== 'User' && typename !== 'GroupMember') return null;
+  private addMemberDeduped(member: GroupMember, members: GroupMember[], seenNames: Set<string>): void {
+    if (seenNames.has(member.profileName)) {
+      // If this one has more data, replace
+      const existingIdx = members.findIndex(m => m.profileName === member.profileName);
+      if (existingIdx !== -1) {
+        const existing = members[existingIdx];
+        const existingScore = (existing.profileUrl ? 1 : 0) + (existing.bio ? 1 : 0) + (existing.joinedDate ? 1 : 0) + (existing.location ? 1 : 0);
+        const newScore = (member.profileUrl ? 1 : 0) + (member.bio ? 1 : 0) + (member.joinedDate ? 1 : 0) + (member.location ? 1 : 0);
+        if (newScore > existingScore) {
+          members[existingIdx] = member;
+        }
+      }
+    } else {
+      seenNames.add(member.profileName);
+      members.push(member);
+    }
+  }
 
-    const name = typeof obj.name === 'string' ? obj.name : '';
+  private tryExtractMember(
+    userNode: Record<string, unknown>,
+    groupName: string,
+    edgeOrParent?: Record<string, unknown>,
+  ): GroupMember | null {
+    const name = typeof userNode.name === 'string' ? userNode.name : '';
     if (!name || name.length < 2) return null;
 
     let url = '';
-    if (typeof obj.url === 'string') url = obj.url;
-    else if (typeof obj.uri === 'string') url = obj.uri;
-    else if (typeof obj.profile_url === 'string') url = obj.profile_url;
+    if (typeof userNode.url === 'string') url = userNode.url;
+    else if (typeof userNode.uri === 'string') url = userNode.uri;
+    else if (typeof userNode.profile_url === 'string') url = userNode.profile_url;
 
     // Skip if URL points to a group, page, etc.
     if (url.includes('/groups/') || url.includes('/pages/')) return null;
 
-    // Extract optional fields from this node's subtree
-    const bio = this.findStringField(obj, ['bio_text', 'bio', 'subtitle', 'secondary_text']);
-    const joinDate = this.findStringField(obj, ['membership', 'join_status_text']);
+    // Look for optional fields on the user node first, then on the parent/edge object
+    const searchTargets = [userNode, ...(edgeOrParent ? [edgeOrParent] : [])];
+
+    let bio = '';
+    let joinDate = '';
+    let mutualFriends = 0;
+
+    for (const target of searchTargets) {
+      if (!bio) bio = this.findStringField(target, ['bio_text', 'bio', 'subtitle', 'secondary_text', 'secondary_subtitle']);
+      if (!joinDate) joinDate = this.findStringField(target, ['membership', 'join_status_text', 'joined', 'member_since', 'group_membership_info']);
+      if (!mutualFriends) {
+        // Check multiple patterns for mutual friends
+        for (const key of ['mutual_friends', 'mutual_friends_count']) {
+          const val = target[key];
+          if (typeof val === 'number' && val > 0) { mutualFriends = val; break; }
+          if (val && typeof val === 'object') {
+            const mf = val as Record<string, unknown>;
+            if (typeof mf.count === 'number' && mf.count > 0) { mutualFriends = mf.count; break; }
+            if (typeof mf.text === 'string') {
+              const num = parseInt(mf.text.replace(/\D/g, ''));
+              if (num > 0) { mutualFriends = num; break; }
+            }
+          }
+        }
+      }
+    }
+
+    // Also deep-search the edge/parent object for nested fields (Facebook sometimes nests them)
+    if (edgeOrParent && (!bio || !joinDate)) {
+      for (const [key, val] of Object.entries(edgeOrParent)) {
+        if (key === 'node') continue; // Skip the user node itself
+        if (val && typeof val === 'object' && !Array.isArray(val)) {
+          const nested = val as Record<string, unknown>;
+          if (!bio && typeof nested.text === 'string' && nested.text.length > 0) {
+            // Heuristic: check if this looks like a bio/subtitle field
+            if (['subtitle', 'bio_text', 'secondary_text', 'secondary_subtitle', 'descriptive_text'].includes(key)) {
+              bio = nested.text;
+            }
+          }
+          if (!joinDate && typeof nested.text === 'string' && nested.text.length > 0) {
+            if (['join_status_text', 'membership', 'group_membership_info', 'timestamp_text', 'member_since_text'].includes(key)) {
+              joinDate = nested.text;
+            }
+          }
+        }
+      }
+    }
 
     let location = '';
     let bioText = '';
     if (bio) {
-      if (bio.startsWith('Lives in') || bio.startsWith('From')) {
-        location = bio.replace(/^(?:Lives in|From)\s*/i, '');
+      // Detect location patterns in multiple languages
+      const locationPatterns = /^(?:Lives in|From|Wohnt in|Lebt in|Kommt aus|Vit à|Vive en)\s+/i;
+      if (locationPatterns.test(bio)) {
+        location = bio.replace(locationPatterns, '');
       } else {
         bioText = bio;
       }
-    }
-
-    // Extract mutual friends count
-    let mutualFriends = 0;
-    if (obj.mutual_friends && typeof obj.mutual_friends === 'object') {
-      const mf = obj.mutual_friends as Record<string, unknown>;
-      if (typeof mf.count === 'number') mutualFriends = mf.count;
     }
 
     return {

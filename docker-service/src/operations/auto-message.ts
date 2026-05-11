@@ -8,32 +8,62 @@ import { randomDelay } from '../utils/helpers';
 const log = createChildLogger({ service: 'AutoMessage' });
 
 // Language-agnostic selectors for Facebook Messenger
-// "To" field labels: English="To", German="An", French="À", Spanish="Para"
+// Strategy 1: aria-label based (To/An/À/Para)
+// Strategy 2: role-based (combobox, searchbox)
+// Strategy 3: placeholder-based
+// Strategy 4: generic input in Messenger context
 const TO_FIELD_SELECTORS = [
+  // Aria-label based - "To" field in multiple languages
   'input[aria-label*="To"]',
   'input[aria-label*="An"]',
   'input[aria-label*="À"]',
   'input[aria-label*="Para"]',
+  'input[aria-label*="Recipient"]',
+  'input[aria-label*="Empfänger"]',
+  // Role-based selectors
+  'input[role="combobox"]',
+  'input[role="searchbox"]',
+  // Placeholder-based
   'input[placeholder*="To"]',
   'input[placeholder*="An"]',
-  'input[placeholder*="Suche"]',
   'input[placeholder*="Search"]',
+  'input[placeholder*="Suche"]',
+  'input[placeholder*="Suchen"]',
+  'input[placeholder*="Name"]',
+  // Name/type based
   'input[name="participants"]',
-  'input[type="text"][role="combobox"]',
+  'input[name="query"]',
+  // Messenger-specific structure: input within header/compose area
+  '[data-testid="messenger-composer-contact-search-input"]',
+  'form input[type="text"]',
+  'form input[type="search"]',
+  // Broader fallbacks
+  '[role="banner"] input[type="text"]',
+  '[role="dialog"] input[type="text"]',
+  'input[type="search"]',
 ].join(', ');
 
 const USER_RESULT_SELECTORS = [
   '[role="listbox"] [role="option"]',
   '[role="list"] [role="listitem"]',
   'ul[role="listbox"] li',
+  'ul li[role="option"]',
   '[data-testid="mwthreadlist-item"]',
+  // Generic clickable results below search
+  '[role="listbox"] > *',
+  '[aria-expanded="true"] ~ * [role="option"]',
 ].join(', ');
 
 const MESSAGE_INPUT_SELECTORS = [
   '[role="textbox"][contenteditable="true"]',
   'div[contenteditable="true"][aria-label]',
+  'div[contenteditable="true"][data-lexical-editor]',
+  'div[contenteditable="true"][spellcheck]',
   'p[contenteditable="true"]',
   'div[data-contents="true"]',
+  // Footer area textbox
+  '[role="main"] [role="textbox"]',
+  'footer [contenteditable="true"]',
 ].join(', ');
 
 export class AutoMessage {
@@ -59,12 +89,26 @@ export class AutoMessage {
       await randomDelay(2000, 4000);
 
       // Wait for Messenger UI to load - look for any input or textbox
-      await page.waitForSelector('input, [contenteditable="true"]', { timeout: 15000 }).catch(() => null);
+      await page.waitForSelector('input, [contenteditable="true"], [role="textbox"]', { timeout: 15000 }).catch(() => null);
       await randomDelay(500, 1000);
 
-      // Search for user in the "To" field
+      // Search for user in the "To" field - try multiple strategies
       log.info('Looking for recipient input field');
-      const toField = await page.waitForSelector(TO_FIELD_SELECTORS, { timeout: 10000 }).catch(() => null);
+      let toField = await page.waitForSelector(TO_FIELD_SELECTORS, { timeout: 10000 }).catch(() => null);
+
+      // Fallback: if no specific selector matched, try finding any visible text input on the page
+      if (!toField) {
+        log.info('Primary selectors failed, trying fallback input detection');
+        const inputs = await page.$$('input[type="text"], input:not([type]), input[type="search"]');
+        for (const input of inputs) {
+          const visible = await input.isVisible().catch(() => false);
+          if (visible) {
+            toField = input;
+            log.info('Found fallback input element');
+            break;
+          }
+        }
+      }
 
       if (!toField) {
         const pageContent = await page.content();
@@ -72,7 +116,12 @@ export class AutoMessage {
         if (hasLoginForm) {
           throw new MessageSendError('Session expired - redirected to login page');
         }
-        throw new MessageSendError('Could not find recipient input field - Messenger UI may have changed');
+        // Log diagnostic info
+        const pageUrl = page.url();
+        const inputCount = (pageContent.match(/<input/gi) || []).length;
+        const contentEditableCount = (pageContent.match(/contenteditable="true"/gi) || []).length;
+        log.warn({ pageUrl, inputCount, contentEditableCount }, 'Could not find recipient input - page diagnostics');
+        throw new MessageSendError(`Could not find recipient input field on ${pageUrl} (inputs: ${inputCount}, contenteditable: ${contentEditableCount})`);
       }
 
       // Type the username
