@@ -84,45 +84,157 @@ export class AutoMessage {
       try {
         const url = new URL(username);
         profilePath = url.pathname.replace(/^\//, '').replace(/\/$/, '');
+        // Handle profile.php?id=123 style URLs
+        const idParam = url.searchParams.get('id');
+        if (idParam && /^\d+$/.test(idParam)) {
+          return idParam;
+        }
       } catch {
         // Not a valid URL, use as-is
       }
     }
 
-    // Try to resolve by fetching the profile page
-    const profileUrl = `https://www.facebook.com/${profilePath}`;
-    log.info({ profileUrl }, 'Resolving user ID from profile');
+    // If it looks like a Facebook username (no spaces, not a display name),
+    // try fetching the profile page first
+    const isDisplayName = /\s/.test(profilePath);
 
-    const response = await this.httpClient.request(profileUrl);
+    if (!isDisplayName) {
+      const profileUrl = `https://www.facebook.com/${encodeURIComponent(profilePath)}`;
+      log.info({ profileUrl }, 'Resolving user ID from profile');
 
-    // Try multiple patterns to extract user ID from the profile HTML
-    const patterns = [
-      /"userID":"(\d+)"/,
-      /"entity_id":"(\d+)"/,
-      /"ownerID":"(\d+)"/,
-      /"profileID":"(\d+)"/,
-      /content="fb:\/\/profile\/(\d+)"/,
-      /"user_id":"(\d+)"/,
-      /"actorID":"(\d+)"/,
-    ];
+      try {
+        const response = await this.httpClient.request(profileUrl);
 
-    for (const pattern of patterns) {
-      const match = response.body.match(pattern);
-      if (match && match[1] !== this.httpClient.getUserId()) {
-        log.info({ userId: match[1] }, 'Resolved user ID from profile page');
-        return match[1];
+        // Try multiple patterns to extract user ID from the profile HTML
+        const patterns = [
+          /"userID":"(\d+)"/,
+          /"entity_id":"(\d+)"/,
+          /"ownerID":"(\d+)"/,
+          /"profileID":"(\d+)"/,
+          /content="fb:\/\/profile\/(\d+)"/,
+          /"user_id":"(\d+)"/,
+          /"actorID":"(\d+)"/,
+        ];
+
+        for (const pattern of patterns) {
+          const match = response.body.match(pattern);
+          if (match && match[1] !== this.httpClient.getUserId()) {
+            log.info({ userId: match[1] }, 'Resolved user ID from profile page');
+            return match[1];
+          }
+        }
+      } catch (error) {
+        log.warn({ error, profilePath }, 'Failed to fetch profile page, falling back to search');
       }
     }
 
-    // Fallback: try the typeahead search
-    return this.searchUser(profilePath, tokens);
+    // Search by name using multiple strategies
+    return this.searchUser(username, tokens);
   }
 
   private async searchUser(
     query: string,
     tokens: { fbDtsg: string; jazoest: string; lsd: string },
   ): Promise<string> {
-    log.info({ query }, 'Searching for user via typeahead');
+    log.info({ query }, 'Searching for user');
+
+    // Strategy 1: GraphQL search (modern Facebook)
+    try {
+      const userId = await this.searchViaGraphQL(query, tokens);
+      if (userId) return userId;
+    } catch (error) {
+      log.warn({ error }, 'GraphQL search failed');
+    }
+
+    // Strategy 2: Typeahead search (legacy endpoint)
+    try {
+      const userId = await this.searchViaTypeahead(query, tokens);
+      if (userId) return userId;
+    } catch (error) {
+      log.warn({ error }, 'Typeahead search failed');
+    }
+
+    // Strategy 3: Web search on Facebook
+    try {
+      const userId = await this.searchViaWebSearch(query);
+      if (userId) return userId;
+    } catch (error) {
+      log.warn({ error }, 'Web search failed');
+    }
+
+    throw new UserNotFoundError(query);
+  }
+
+  private async searchViaGraphQL(
+    query: string,
+    tokens: { fbDtsg: string; jazoest: string; lsd: string },
+  ): Promise<string | null> {
+    log.debug({ query }, 'Trying GraphQL search');
+
+    const variables = JSON.stringify({
+      rawQuery: query,
+      querySource: 'MESSAGING_SEARCH',
+      searchRequestID: `search_${Date.now()}`,
+    });
+
+    const params = new URLSearchParams({
+      fb_dtsg: tokens.fbDtsg,
+      jazoest: tokens.jazoest,
+      lsd: tokens.lsd,
+      fb_api_caller_class: 'RelayModern',
+      fb_api_req_friendly_name: 'SearchCometResultsPaginatedResultsQuery',
+      variables,
+      doc_id: '6071559492883486',
+      __a: '1',
+    });
+
+    const response = await this.httpClient.post(
+      'https://www.facebook.com/api/graphql/',
+      params.toString(),
+      { referer: 'https://www.facebook.com/messages/' },
+    );
+
+    const body = response.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
+
+    // Try to find user IDs in the GraphQL response
+    const idPatterns = [
+      /"id"\s*:\s*"(\d+)"/g,
+      /"user_id"\s*:\s*"(\d+)"/g,
+      /"uid"\s*:\s*"?(\d+)"?/g,
+      /"entity_id"\s*:\s*"(\d+)"/g,
+    ];
+
+    const myId = this.httpClient.getUserId();
+    const candidates: string[] = [];
+
+    for (const pattern of idPatterns) {
+      let match;
+      while ((match = pattern.exec(body)) !== null) {
+        if (match[1] !== myId && match[1].length > 5) {
+          candidates.push(match[1]);
+        }
+      }
+    }
+
+    if (candidates.length > 0) {
+      // Return the most frequently occurring ID (most likely the search result)
+      const freq = new Map<string, number>();
+      for (const id of candidates) {
+        freq.set(id, (freq.get(id) || 0) + 1);
+      }
+      const sorted = [...freq.entries()].sort((a, b) => b[1] - a[1]);
+      log.info({ userId: sorted[0][0], query }, 'Found user via GraphQL search');
+      return sorted[0][0];
+    }
+
+    return null;
+  }
+
+  private async searchViaTypeahead(
+    query: string,
+    tokens: { fbDtsg: string; jazoest: string; lsd: string },
+  ): Promise<string | null> {
+    log.debug({ query }, 'Trying typeahead search');
 
     const params = new URLSearchParams({
       value: query,
@@ -136,7 +248,6 @@ export class AutoMessage {
       { referer: 'https://www.facebook.com/messages/' },
     );
 
-    // Facebook AJAX responses have "for (;;);" prefix
     const body = response.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
 
     try {
@@ -148,14 +259,42 @@ export class AutoMessage {
         return userId;
       }
     } catch {
-      // Try regex fallback on the response
       const idMatch = body.match(/"uid"\s*:\s*(\d+)/);
       if (idMatch) {
         return idMatch[1];
       }
     }
 
-    throw new UserNotFoundError(query);
+    return null;
+  }
+
+  private async searchViaWebSearch(query: string): Promise<string | null> {
+    log.debug({ query }, 'Trying web search');
+
+    const searchUrl = `https://www.facebook.com/search/people/?q=${encodeURIComponent(query)}`;
+    const response = await this.httpClient.request(searchUrl, {
+      referer: 'https://www.facebook.com/',
+    });
+
+    // Look for profile links and user IDs in the search results page
+    const patterns = [
+      /"entity_id"\s*:\s*"(\d+)"/,
+      /"userID"\s*:\s*"(\d+)"/,
+      /"id"\s*:\s*"(\d{8,})"/,
+      /\/profile\/(\d+)/,
+    ];
+
+    const myId = this.httpClient.getUserId();
+
+    for (const pattern of patterns) {
+      const match = response.body.match(pattern);
+      if (match && match[1] !== myId && match[1].length > 5) {
+        log.info({ userId: match[1], query }, 'Found user via web search');
+        return match[1];
+      }
+    }
+
+    return null;
   }
 
   private async sendViaMessaging(
