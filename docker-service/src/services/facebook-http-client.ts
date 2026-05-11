@@ -188,7 +188,38 @@ export class FacebookHttpClient {
   }
 
   /**
-   * Make an HTTP(S) request with automatic:
+   * Extract Facebook-specific tokens (fb_dtsg, jazoest, etc.) from the HTML.
+   * These are required for GraphQL API calls.
+   */
+  extractTokens(html: string): { fbDtsg: string; jazoest: string; lsd: string } {
+    let fbDtsg = '';
+    let jazoest = '';
+    let lsd = '';
+
+    // fb_dtsg token
+    const dtsgMatch =
+      html.match(/"DTSGInitialData"\s*,\s*\[\]\s*,\s*\{\s*"token"\s*:\s*"([^"]+)"/) ||
+      html.match(/name="fb_dtsg"\s+value="([^"]+)"/) ||
+      html.match(/"dtsg"\s*:\s*\{\s*"token"\s*:\s*"([^"]+)"/);
+    if (dtsgMatch) fbDtsg = dtsgMatch[1];
+
+    // jazoest
+    const jazoestMatch =
+      html.match(/name="jazoest"\s+value="(\d+)"/) ||
+      html.match(/"jazoest"\s*:\s*"(\d+)"/);
+    if (jazoestMatch) jazoest = jazoestMatch[1];
+
+    // lsd token
+    const lsdMatch =
+      html.match(/"LSD"\s*,\s*\[\]\s*,\s*\{\s*"token"\s*:\s*"([^"]+)"/) ||
+      html.match(/name="lsd"\s+value="([^"]+)"/);
+    if (lsdMatch) lsd = lsdMatch[1];
+
+    return { fbDtsg, jazoest, lsd };
+  }
+
+  /**
+   * Make an HTTP(S) GET request with automatic:
    * - Cookie sending
    * - Set-Cookie processing (cookie jar update)
    * - Redirect following (up to MAX_REDIRECTS)
@@ -197,11 +228,30 @@ export class FacebookHttpClient {
     url: string,
     options: { referer?: string; timeout?: number } = {},
   ): Promise<HttpResponse> {
+    return this.requestWithMethod('GET', url, options);
+  }
+
+  /**
+   * Make an HTTP(S) POST request (used for GraphQL API calls).
+   */
+  async post(
+    url: string,
+    body: string,
+    options: { referer?: string; timeout?: number; contentType?: string } = {},
+  ): Promise<HttpResponse> {
+    return this.requestWithMethod('POST', url, { ...options, body, contentType: options.contentType });
+  }
+
+  private async requestWithMethod(
+    method: string,
+    url: string,
+    options: { referer?: string; timeout?: number; body?: string; contentType?: string } = {},
+  ): Promise<HttpResponse> {
     let currentUrl = url;
     let redirectCount = 0;
 
     while (redirectCount <= MAX_REDIRECTS) {
-      const response = await this.rawRequest(currentUrl, options);
+      const response = await this.rawRequest(currentUrl, method, options);
 
       // Process Set-Cookie headers from EVERY response (including redirects)
       this.processSetCookieHeaders(response.headers);
@@ -228,7 +278,7 @@ export class FacebookHttpClient {
     }
 
     // If we exhausted redirects, make one final request
-    return this.rawRequest(currentUrl, options);
+    return this.rawRequest(currentUrl, 'GET', options);
   }
 
   /**
@@ -236,24 +286,40 @@ export class FacebookHttpClient {
    */
   private rawRequest(
     url: string,
-    options: { referer?: string; timeout?: number },
+    method: string,
+    options: { referer?: string; timeout?: number; body?: string; contentType?: string },
   ): Promise<HttpResponse> {
     return new Promise((resolve, reject) => {
       const urlObj = new URL(url);
       const timeout = options.timeout || 30000;
       const isHttps = urlObj.protocol === 'https:';
+      const postBody = options.body ? Buffer.from(options.body, 'utf-8') : null;
+
+      const headers: Record<string, string> = {
+        ...DEFAULT_HEADERS,
+        'User-Agent': this.userAgent,
+        Cookie: this.buildCookieString(),
+        Referer: options.referer || 'https://www.facebook.com/',
+      };
+
+      if (postBody) {
+        headers['Content-Type'] = options.contentType || 'application/x-www-form-urlencoded';
+        headers['Content-Length'] = String(postBody.length);
+        // GraphQL requests need different Sec-Fetch headers
+        headers['Sec-Fetch-Dest'] = 'empty';
+        headers['Sec-Fetch-Mode'] = 'cors';
+        headers['Sec-Fetch-Site'] = 'same-origin';
+        headers['X-FB-Friendly-Name'] = 'GroupsCometFeedRegularStoriesPaginationQuery';
+        delete headers['Upgrade-Insecure-Requests'];
+        delete headers['Sec-Fetch-User'];
+      }
 
       const requestOptions = {
         hostname: urlObj.hostname,
         port: urlObj.port || (isHttps ? 443 : 80),
         path: urlObj.pathname + urlObj.search,
-        method: 'GET',
-        headers: {
-          ...DEFAULT_HEADERS,
-          'User-Agent': this.userAgent,
-          Cookie: this.buildCookieString(),
-          Referer: options.referer || 'https://www.facebook.com/',
-        },
+        method,
+        headers,
       };
 
       const handler = (res: http.IncomingMessage) => {
@@ -297,6 +363,9 @@ export class FacebookHttpClient {
         reject(new Error(`Request timeout after ${timeout}ms`));
       });
 
+      if (postBody) {
+        req.write(postBody);
+      }
       req.end();
     });
   }

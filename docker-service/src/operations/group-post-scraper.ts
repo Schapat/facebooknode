@@ -61,9 +61,245 @@ export class GroupPostScraper {
       ? new Date(input.lastScrapeTimestamp).getTime()
       : 0;
 
+    // Parse initial HTML posts
     const posts = this.parsePostsFromHtml(response.body, groupName, groupSlug, maxPosts, cutoffTimestamp);
+    log.info({ groupName, initialPosts: posts.length, maxPosts }, 'Initial page parsed');
+
+    // If we need more posts, paginate via GraphQL
+    if (posts.length < maxPosts) {
+      const seenIds = new Set(posts.map(p => p.postId));
+      await this.paginateWithGraphQL(
+        response.body,
+        normalizedUrl,
+        groupName,
+        groupSlug,
+        maxPosts,
+        cutoffTimestamp,
+        posts,
+        seenIds,
+      );
+    }
+
     log.info({ groupName, postsCount: posts.length }, 'Group scraping complete');
     return posts;
+  }
+
+  /**
+   * Use Facebook's GraphQL API to load additional pages of posts.
+   * Extracts cursor and tokens from HTML, then makes paginated requests.
+   */
+  private async paginateWithGraphQL(
+    html: string,
+    groupUrl: string,
+    groupName: string,
+    groupSlug: string,
+    maxPosts: number,
+    cutoffTimestamp: number,
+    posts: GroupPost[],
+    seenIds: Set<string>,
+  ): Promise<void> {
+    const tokens = this.httpClient.extractTokens(html);
+    if (!tokens.fbDtsg) {
+      log.warn('No fb_dtsg token found, cannot paginate');
+      return;
+    }
+
+    // Find the group ID from the HTML
+    const groupId = this.extractGroupId(html);
+    if (!groupId) {
+      log.warn('No group ID found, cannot paginate');
+      return;
+    }
+
+    // Find initial end_cursor for pagination
+    let cursor = this.extractEndCursor(html);
+    if (!cursor) {
+      log.debug('No pagination cursor found in initial HTML');
+      return;
+    }
+
+    const maxPages = 10; // Safety limit
+    let page = 0;
+    let hitCutoff = false;
+
+    while (posts.length < maxPosts && page < maxPages && cursor && !hitCutoff) {
+      page++;
+      log.debug({ page, postsCount: posts.length, maxPosts }, 'Fetching next page via GraphQL');
+
+      await randomDelay(1000, 3000);
+
+      try {
+        const graphqlPosts = await this.fetchGraphQLPage(
+          tokens,
+          groupId,
+          cursor,
+          groupName,
+          groupSlug,
+          groupUrl,
+        );
+
+        if (!graphqlPosts || graphqlPosts.posts.length === 0) {
+          log.debug({ page }, 'No more posts from GraphQL');
+          break;
+        }
+
+        let newPostsAdded = 0;
+        for (const post of graphqlPosts.posts) {
+          if (seenIds.has(post.postId)) continue;
+          seenIds.add(post.postId);
+
+          if (cutoffTimestamp > 0 && post.createdAt) {
+            const postTime = new Date(post.createdAt).getTime();
+            if (!isNaN(postTime) && postTime < cutoffTimestamp) {
+              hitCutoff = true;
+              break;
+            }
+          }
+
+          posts.push(post);
+          newPostsAdded++;
+          if (posts.length >= maxPosts) break;
+        }
+
+        log.debug({ page, newPostsAdded, total: posts.length }, 'GraphQL page processed');
+
+        if (newPostsAdded === 0) break;
+
+        cursor = graphqlPosts.nextCursor || null;
+      } catch (error) {
+        log.warn({ error, page }, 'GraphQL pagination failed');
+        break;
+      }
+    }
+  }
+
+  private async fetchGraphQLPage(
+    tokens: { fbDtsg: string; jazoest: string; lsd: string },
+    groupId: string,
+    cursor: string,
+    groupName: string,
+    groupSlug: string,
+    referer: string,
+  ): Promise<{ posts: GroupPost[]; nextCursor: string | null } | null> {
+    const variables = JSON.stringify({
+      count: 10,
+      cursor,
+      groupID: groupId,
+      id: groupId,
+      scale: 1,
+    });
+
+    const params = new URLSearchParams({
+      fb_dtsg: tokens.fbDtsg,
+      fb_api_caller_class: 'RelayModern',
+      fb_api_req_friendly_name: 'GroupsCometFeedRegularStoriesPaginationQuery',
+      variables,
+      doc_id: '9232369773455498', // GroupsCometFeedRegularStoriesPaginationQuery
+    });
+
+    if (tokens.jazoest) params.set('jazoest', tokens.jazoest);
+    if (tokens.lsd) params.set('lsd', tokens.lsd);
+
+    const response = await this.httpClient.post(
+      'https://www.facebook.com/api/graphql/',
+      params.toString(),
+      { referer, timeout: 20000 },
+    );
+
+    if (response.statusCode !== 200) {
+      log.warn({ statusCode: response.statusCode }, 'GraphQL request failed');
+      return null;
+    }
+
+    const posts: GroupPost[] = [];
+    const seenIds = new Set<string>();
+    let nextCursor: string | null = null;
+
+    // Facebook returns multiple JSON objects separated by newlines
+    const lines = response.body.split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) continue;
+
+      try {
+        const data = JSON.parse(trimmed);
+
+        // Extract posts from the GraphQL response
+        this.walkJsonForPosts(data, posts, seenIds, groupName, groupSlug, 0);
+
+        // Extract next cursor
+        const cursorVal = this.deepFindEndCursor(data);
+        if (cursorVal) nextCursor = cursorVal;
+      } catch {
+        // Not valid JSON
+      }
+    }
+
+    return { posts, nextCursor };
+  }
+
+  private extractGroupId(html: string): string | null {
+    // Try multiple patterns
+    const patterns = [
+      /"groupID"\s*:\s*"(\d+)"/,
+      /"group_id"\s*:\s*"(\d+)"/,
+      /group\/(\d+)/,
+      /"id"\s*:\s*"(\d+)"[^}]*"__typename"\s*:\s*"Group"/,
+      /"Group"[^}]*"id"\s*:\s*"(\d+)"/,
+      /fb:\/\/group\/(\d+)/,
+      /content="fb:\/\/group\/(\d+)"/,
+      /entity_id\s*:\s*"(\d+)"/,
+    ];
+
+    for (const pattern of patterns) {
+      const match = html.match(pattern);
+      if (match) return match[1];
+    }
+
+    return null;
+  }
+
+  private extractEndCursor(html: string): string | null {
+    // Look for end_cursor in the relay pagination info
+    const patterns = [
+      /"end_cursor"\s*:\s*"([^"]+)"/,
+      /"endCursor"\s*:\s*"([^"]+)"/,
+    ];
+
+    for (const pattern of patterns) {
+      const match = html.match(pattern);
+      if (match) return match[1];
+    }
+
+    return null;
+  }
+
+  private deepFindEndCursor(obj: unknown, depth = 0): string | null {
+    if (depth > 30 || !obj || typeof obj !== 'object') return null;
+
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        const r = this.deepFindEndCursor(item, depth + 1);
+        if (r) return r;
+      }
+      return null;
+    }
+
+    const record = obj as Record<string, unknown>;
+
+    // Check for page_info with end_cursor
+    if (record.page_info && typeof record.page_info === 'object') {
+      const pi = record.page_info as Record<string, unknown>;
+      if (pi.has_next_page === true && typeof pi.end_cursor === 'string') {
+        return pi.end_cursor;
+      }
+    }
+
+    for (const value of Object.values(record)) {
+      const r = this.deepFindEndCursor(value, depth + 1);
+      if (r) return r;
+    }
+    return null;
   }
 
   private parsePostsFromHtml(
