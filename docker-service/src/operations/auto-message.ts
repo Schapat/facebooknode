@@ -30,12 +30,7 @@ export class AutoMessage {
 
     try {
       // Step 1: Get fb_dtsg and other tokens from Facebook
-      // Try multiple pages - homepage may return 400
       const tokens = await this.extractTokens(username);
-
-      if (!tokens.fbDtsg) {
-        throw new MessageSendError('Could not extract fb_dtsg token - session may be expired');
-      }
 
       const myUserId = this.httpClient.getUserId();
       if (!myUserId) {
@@ -47,7 +42,7 @@ export class AutoMessage {
 
       await randomDelay(1000, 2000);
 
-      // Step 3: Send the message
+      // Step 3: Send the message (mbasic first, then GraphQL/legacy fallbacks)
       await this.sendViaMessaging(recipientId, myUserId, message, tokens);
 
       const sentAt = new Date().toISOString();
@@ -86,7 +81,30 @@ export class AutoMessage {
       }
     }
 
-    // Try multiple pages to get tokens
+    // Try mbasic first — simpler page, more reliable token extraction
+    try {
+      log.debug('Trying mbasic.facebook.com for tokens');
+      const response = await this.httpClient.request('https://mbasic.facebook.com/');
+
+      if (this.httpClient.isLoginPage(response.body)) {
+        log.warn('mbasic returned login page — session may be expired');
+      } else {
+        const dtsgMatch = response.body.match(/name="fb_dtsg"\s+value="([^"]+)"/);
+        const jazoestMatch = response.body.match(/name="jazoest"\s+value="(\d+)"/);
+        if (dtsgMatch) {
+          log.debug('Extracted tokens from mbasic');
+          return {
+            fbDtsg: dtsgMatch[1],
+            jazoest: jazoestMatch ? jazoestMatch[1] : '',
+            lsd: '',
+          };
+        }
+      }
+    } catch (error) {
+      log.warn({ error }, 'Failed to extract tokens from mbasic');
+    }
+
+    // Fallback: try main facebook.com pages
     const urls = [
       'https://www.facebook.com/',
       'https://www.facebook.com/me',
@@ -104,24 +122,6 @@ export class AutoMessage {
       } catch (error) {
         log.warn({ error, url }, 'Failed to load page for tokens');
       }
-    }
-
-    // Last resort: mbasic has fb_dtsg in footer/locale-change forms
-    try {
-      log.debug('Trying mbasic.facebook.com for tokens');
-      const response = await this.httpClient.request('https://mbasic.facebook.com/');
-      const dtsgMatch = response.body.match(/name="fb_dtsg"\s+value="([^"]+)"/);
-      const jazoestMatch = response.body.match(/name="jazoest"\s+value="(\d+)"/);
-      if (dtsgMatch) {
-        log.debug('Extracted tokens from mbasic');
-        return {
-          fbDtsg: dtsgMatch[1],
-          jazoest: jazoestMatch ? jazoestMatch[1] : '',
-          lsd: '',
-        };
-      }
-    } catch (error) {
-      log.warn({ error }, 'Failed to extract tokens from mbasic');
     }
 
     return { fbDtsg: '', jazoest: '', lsd: '' };
@@ -168,6 +168,7 @@ export class AutoMessage {
           /"profileOwnerID"\s*:\s*"(\d+)"/,
           /content="fb:\/\/profile\/(\d+)"/,
           /"profile_owner"\s*:\{[^}]*?"id"\s*:\s*"(\d+)"/,
+          /"userID"\s*:\s*"(\d+)"/,
         ];
 
         const myId = this.httpClient.getUserId();
@@ -217,23 +218,15 @@ export class AutoMessage {
   ): Promise<string> {
     log.info({ query }, 'Searching for user');
 
-    // Strategy 1: GraphQL search (modern Facebook)
+    // Strategy 1: mbasic search (most reliable, simple HTML parsing)
     try {
-      const userId = await this.searchViaGraphQL(query, tokens);
+      const userId = await this.searchViaMbasic(query);
       if (userId) return userId;
     } catch (error) {
-      log.warn({ error }, 'GraphQL search failed');
+      log.warn({ error }, 'mbasic search failed');
     }
 
-    // Strategy 2: Typeahead search (legacy endpoint)
-    try {
-      const userId = await this.searchViaTypeahead(query, tokens);
-      if (userId) return userId;
-    } catch (error) {
-      log.warn({ error }, 'Typeahead search failed');
-    }
-
-    // Strategy 3: Web search on Facebook
+    // Strategy 2: Web search on Facebook
     try {
       const userId = await this.searchViaWebSearch(query);
       if (userId) return userId;
@@ -241,7 +234,102 @@ export class AutoMessage {
       log.warn({ error }, 'Web search failed');
     }
 
+    // Strategy 3: GraphQL search (may have outdated doc_id)
+    if (tokens.fbDtsg) {
+      try {
+        const userId = await this.searchViaGraphQL(query, tokens);
+        if (userId) return userId;
+      } catch (error) {
+        log.warn({ error }, 'GraphQL search failed');
+      }
+
+      // Strategy 4: Typeahead search (legacy endpoint)
+      try {
+        const userId = await this.searchViaTypeahead(query, tokens);
+        if (userId) return userId;
+      } catch (error) {
+        log.warn({ error }, 'Typeahead search failed');
+      }
+    }
+
     throw new UserNotFoundError(query);
+  }
+
+  private async searchViaMbasic(query: string): Promise<string | null> {
+    log.debug({ query }, 'Trying mbasic people search');
+
+    const searchUrl = `https://mbasic.facebook.com/search/people/?q=${encodeURIComponent(query)}`;
+    const response = await this.httpClient.request(searchUrl, {
+      referer: 'https://mbasic.facebook.com/',
+    });
+
+    if (this.httpClient.isLoginPage(response.body)) {
+      log.warn('mbasic search returned login page');
+      return null;
+    }
+
+    const myId = this.httpClient.getUserId();
+
+    // Pattern 1: profile.php?id=123 links (most common on mbasic)
+    const profilePhpPattern = /\/profile\.php\?id=(\d+)/g;
+    let m;
+    while ((m = profilePhpPattern.exec(response.body)) !== null) {
+      if (m[1] !== myId) {
+        log.info({ userId: m[1], query }, 'Found user via mbasic profile.php link');
+        return m[1];
+      }
+    }
+
+    // Pattern 2: /messages/thread/USERID links
+    const threadPattern = /\/messages\/thread\/(\d+)/g;
+    while ((m = threadPattern.exec(response.body)) !== null) {
+      if (m[1] !== myId) {
+        log.info({ userId: m[1], query }, 'Found user via mbasic thread link');
+        return m[1];
+      }
+    }
+
+    // Pattern 3: profile_id in data attributes
+    const profileIdPattern = /"profile_id"\s*:\s*(\d+)/g;
+    while ((m = profileIdPattern.exec(response.body)) !== null) {
+      if (m[1] !== myId) {
+        log.info({ userId: m[1], query }, 'Found user via mbasic profile_id');
+        return m[1];
+      }
+    }
+
+    // Pattern 4: Resolve from username links — find <a href="/username"> links
+    // and then load the profile to get the numeric ID
+    const usernameLinks = response.body.match(/href="\/([a-zA-Z0-9._]+)"/g) || [];
+    for (const link of usernameLinks) {
+      const usernameMatch = link.match(/href="\/([a-zA-Z0-9._]+)"/);
+      if (!usernameMatch) continue;
+      const potentialUsername = usernameMatch[1];
+      // Skip common non-profile paths
+      if (['search', 'help', 'messages', 'login', 'a', 'images', 'settings', 'home', 'buddylist', 'composer'].includes(potentialUsername)) continue;
+      if (potentialUsername.includes('.php')) continue;
+
+      // Try loading this profile on mbasic to extract ID
+      try {
+        const profileResp = await this.httpClient.request(
+          `https://mbasic.facebook.com/${potentialUsername}`,
+          { referer: 'https://mbasic.facebook.com/' },
+        );
+        const idMatch = profileResp.body.match(/\/profile\.php\?id=(\d+)/) ||
+          profileResp.body.match(/owner_id=(\d+)/) ||
+          profileResp.body.match(/subject_id=(\d+)/);
+        if (idMatch && idMatch[1] !== myId) {
+          log.info({ userId: idMatch[1], username: potentialUsername, query }, 'Resolved user via mbasic profile page');
+          return idMatch[1];
+        }
+      } catch {
+        // Continue to next link
+      }
+      break; // Only try the first plausible link
+    }
+
+    log.debug({ query, bodyLength: response.body.length }, 'No user found on mbasic search');
+    return null;
   }
 
   private async searchViaGraphQL(
@@ -275,6 +363,11 @@ export class AutoMessage {
 
     const body = response.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
 
+    if (response.statusCode !== 200 || body.includes('"was not found"')) {
+      log.warn({ statusCode: response.statusCode }, 'GraphQL search endpoint returned error');
+      return null;
+    }
+
     // Try to find user IDs in the GraphQL response
     const idPatterns = [
       /"id"\s*:\s*"(\d+)"/g,
@@ -296,7 +389,6 @@ export class AutoMessage {
     }
 
     if (candidates.length > 0) {
-      // Return the most frequently occurring ID (most likely the search result)
       const freq = new Map<string, number>();
       for (const id of candidates) {
         freq.set(id, (freq.get(id) || 0) + 1);
@@ -384,7 +476,21 @@ export class AutoMessage {
   ): Promise<void> {
     const errors: string[] = [];
 
-    // Strategy 1: GraphQL API (same mechanism as working scrapers)
+    // Strategy 1: mbasic.facebook.com HTML form (most reliable)
+    try {
+      await this.sendViaMbasic(recipientId, message);
+      return;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      log.warn({ error: msg }, 'mbasic send failed, trying next strategy');
+      errors.push(`mbasic: ${msg}`);
+    }
+
+    if (!tokens.fbDtsg) {
+      throw new MessageSendError(`All message send strategies failed (no fb_dtsg for API calls): ${errors.join('; ')}`);
+    }
+
+    // Strategy 2: GraphQL API
     try {
       await this.sendViaGraphQL(recipientId, myUserId, message, tokens);
       return;
@@ -394,27 +500,116 @@ export class AutoMessage {
       errors.push(`graphql: ${msg}`);
     }
 
-    // Strategy 2: Legacy /messaging/send/ endpoint
+    // Strategy 3: Legacy /messaging/send/ endpoint
     try {
       await this.sendViaLegacyEndpoint(recipientId, myUserId, message, tokens);
       return;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      log.warn({ error: msg }, 'Legacy send failed, trying next strategy');
+      log.warn({ error: msg }, 'Legacy send failed');
       errors.push(`legacy: ${msg}`);
     }
 
-    // Strategy 3: mbasic.facebook.com HTML form
-    try {
-      await this.sendViaMbasic(recipientId, message);
-      return;
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      log.warn({ error: msg }, 'mbasic send failed');
-      errors.push(`mbasic: ${msg}`);
+    throw new MessageSendError(`All message send strategies failed: ${errors.join('; ')}`);
+  }
+
+  private async sendViaMbasic(recipientId: string, message: string): Promise<void> {
+    log.info({ recipientId }, 'Sending message via mbasic.facebook.com');
+
+    // Step 1: Load the compose page to get the form and hidden fields
+    const composeUrl = `https://mbasic.facebook.com/messages/compose/?ids=${recipientId}`;
+    const page = await this.httpClient.request(composeUrl, {
+      referer: 'https://mbasic.facebook.com/',
+    });
+
+    if (this.httpClient.isLoginPage(page.body)) {
+      throw new MessageSendError('Session not valid on mbasic (login page)');
     }
 
-    throw new MessageSendError(`All message send strategies failed: ${errors.join('; ')}`);
+    // Step 2: Find the message send form (try multiple patterns)
+    const formMatch =
+      page.body.match(/<form[^>]*action="(\/messages\/[^"]*)"[^>]*method="post"/i) ||
+      page.body.match(/<form[^>]*method="post"[^>]*action="(\/messages\/[^"]*)"/i) ||
+      page.body.match(/<form[^>]*action="(\/messages\/send\/[^"]*)"[^>]*/i);
+
+    if (!formMatch) {
+      // Try alternate compose URL: direct thread
+      const threadUrl = `https://mbasic.facebook.com/messages/read/?tid=cid.c.${recipientId}%3A${this.httpClient.getUserId()}`;
+      log.debug({ threadUrl }, 'No compose form found, trying thread URL');
+
+      const threadPage = await this.httpClient.request(threadUrl, {
+        referer: 'https://mbasic.facebook.com/messages/',
+      });
+
+      const threadFormMatch =
+        threadPage.body.match(/<form[^>]*action="(\/messages\/[^"]*)"[^>]*method="post"/i) ||
+        threadPage.body.match(/<form[^>]*method="post"[^>]*action="(\/messages\/[^"]*)"/i);
+
+      if (!threadFormMatch) {
+        log.debug({ bodySnippet: page.body.substring(0, 2000) }, 'mbasic compose page preview');
+        throw new MessageSendError('No message form found on mbasic compose or thread page');
+      }
+
+      return this.submitMbasicForm(threadPage.body, threadFormMatch[1], message, threadUrl);
+    }
+
+    return this.submitMbasicForm(page.body, formMatch[1], message, composeUrl);
+  }
+
+  private async submitMbasicForm(
+    pageBody: string,
+    rawFormAction: string,
+    message: string,
+    referer: string,
+  ): Promise<void> {
+    let formAction = rawFormAction.replace(/&amp;/g, '&');
+    if (!formAction.startsWith('http')) {
+      formAction = `https://mbasic.facebook.com${formAction}`;
+    }
+
+    // Extract hidden input fields from the form
+    const params = new URLSearchParams();
+    const hiddenRegex = /<input[^>]*type="hidden"[^>]*/gi;
+    let match;
+    while ((match = hiddenRegex.exec(pageBody)) !== null) {
+      const tag = match[0];
+      const nameMatch = tag.match(/name="([^"]*)"/);
+      const valueMatch = tag.match(/value="([^"]*)"/);
+      if (nameMatch) {
+        params.append(
+          nameMatch[1].replace(/&amp;/g, '&'),
+          valueMatch ? valueMatch[1].replace(/&amp;/g, '&') : '',
+        );
+      }
+    }
+
+    // Add message body
+    params.append('body', message);
+
+    // Extract submit button value (German: "Senden", English: "Send", etc.)
+    const submitMatch = pageBody.match(/<input[^>]*name="send"[^>]*value="([^"]*)"/i);
+    params.append('send', submitMatch ? submitMatch[1] : 'Senden');
+
+    log.debug({ formAction, hiddenFieldCount: [...params.keys()].length }, 'Submitting mbasic message form');
+
+    const response = await this.httpClient.post(formAction, params.toString(), {
+      referer,
+    });
+
+    if (response.statusCode >= 400) {
+      throw new MessageSendError(`mbasic send returned HTTP ${response.statusCode}`);
+    }
+
+    // Check for success indicators
+    const hasThread = response.body.includes('/messages/read/') || response.body.includes('/messages/thread/');
+    if (hasThread) {
+      log.info('Message confirmed sent via mbasic (thread link found in response)');
+    } else if (response.body.includes('error') && response.body.length < 2000) {
+      log.warn({ bodySnippet: response.body.substring(0, 500) }, 'mbasic response may contain error');
+      // Don't throw — Facebook sometimes returns pages without thread links but message was still sent
+    }
+
+    log.info('Message sent via mbasic.facebook.com');
   }
 
   private async sendViaGraphQL(
@@ -424,6 +619,25 @@ export class AutoMessage {
     tokens: { fbDtsg: string; jazoest: string; lsd: string },
   ): Promise<void> {
     log.info({ recipientId }, 'Sending message via GraphQL API');
+
+    // Try to extract a fresh doc_id from the Messenger page
+    let docId = '7316395148464937'; // fallback
+    try {
+      const messengerPage = await this.httpClient.request(
+        `https://www.facebook.com/messages/t/${recipientId}`,
+        { referer: 'https://www.facebook.com/messages/' },
+      );
+      // Look for send message mutation doc_id in page bundle
+      const docIdMatch =
+        messengerPage.body.match(/useSendMessageMutation[^}]{0,500}?(?:doc_id|"id")\s*[:=]\s*"(\d{10,})"/) ||
+        messengerPage.body.match(/(?:doc_id|"id")\s*[:=]\s*"(\d{10,})"[^}]{0,500}?useSendMessageMutation/);
+      if (docIdMatch) {
+        docId = docIdMatch[1];
+        log.info({ docId }, 'Extracted fresh send message doc_id');
+      }
+    } catch (error) {
+      log.debug({ error }, 'Could not extract fresh doc_id, using fallback');
+    }
 
     const variables = JSON.stringify({
       input: {
@@ -441,7 +655,7 @@ export class AutoMessage {
       fb_api_caller_class: 'RelayModern',
       fb_api_req_friendly_name: 'useSendMessageMutation',
       variables,
-      doc_id: '7316395148464937',
+      doc_id: docId,
       __user: myUserId,
       __a: '1',
     });
@@ -461,13 +675,18 @@ export class AutoMessage {
 
     // Check for errors in response
     try {
-      const data = JSON.parse(body);
-      if (data.error === 1357001 || body.includes('"errorSummary"')) {
-        throw new MessageSendError('GraphQL: session not authenticated');
-      }
-      if (data.errors && data.errors.length > 0) {
-        const errMsg = data.errors[0]?.message || JSON.stringify(data.errors);
-        throw new MessageSendError(`GraphQL error: ${errMsg}`);
+      // GraphQL responses can be multi-line JSON objects
+      for (const line of body.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('{')) continue;
+        const data = JSON.parse(trimmed);
+        if (data.error === 1357001 || data.errorSummary) {
+          throw new MessageSendError('GraphQL: session not authenticated');
+        }
+        if (data.errors && data.errors.length > 0) {
+          const errMsg = data.errors[0]?.message || JSON.stringify(data.errors);
+          throw new MessageSendError(`GraphQL error: ${errMsg}`);
+        }
       }
     } catch (e) {
       if (e instanceof MessageSendError) throw e;
@@ -475,69 +694,6 @@ export class AutoMessage {
     }
 
     log.info({ recipientId }, 'Message sent via GraphQL');
-  }
-
-  private async sendViaMbasic(recipientId: string, message: string): Promise<void> {
-    const composeUrl = `https://mbasic.facebook.com/messages/compose/?ids=${recipientId}`;
-    log.info({ recipientId }, 'Trying mbasic.facebook.com message send');
-
-    const page = await this.httpClient.request(composeUrl, {
-      referer: 'https://mbasic.facebook.com/',
-    });
-
-    if (this.httpClient.isLoginPage(page.body)) {
-      throw new MessageSendError('Session not valid on mbasic (login page)');
-    }
-
-    // Find the message send form
-    const formMatch =
-      page.body.match(/<form[^>]*action="(\/messages\/[^"]*)"[^>]*method="post"/i) ||
-      page.body.match(/<form[^>]*method="post"[^>]*action="(\/messages\/[^"]*)"/i);
-
-    if (!formMatch) {
-      log.debug({ bodySnippet: page.body.substring(0, 1000) }, 'mbasic page preview');
-      throw new MessageSendError('No message form found on mbasic compose page');
-    }
-
-    let formAction = formMatch[1].replace(/&amp;/g, '&');
-    if (!formAction.startsWith('http')) {
-      formAction = `https://mbasic.facebook.com${formAction}`;
-    }
-
-    // Extract hidden input fields
-    const params = new URLSearchParams();
-    const hiddenRegex = /<input[^>]*type="hidden"[^>]*/gi;
-    let match;
-    while ((match = hiddenRegex.exec(page.body)) !== null) {
-      const tag = match[0];
-      const nameMatch = tag.match(/name="([^"]*)"/);
-      const valueMatch = tag.match(/value="([^"]*)"/);
-      if (nameMatch) {
-        params.append(
-          nameMatch[1].replace(/&amp;/g, '&'),
-          valueMatch ? valueMatch[1].replace(/&amp;/g, '&') : '',
-        );
-      }
-    }
-
-    // Add message body
-    params.append('body', message);
-
-    // Extract submit button value (German: "Senden", English: "Send")
-    const submitMatch = page.body.match(/<input[^>]*name="send"[^>]*value="([^"]*)"/i);
-    params.append('send', submitMatch ? submitMatch[1] : 'Senden');
-
-    log.debug({ formAction }, 'Submitting mbasic message form');
-
-    const response = await this.httpClient.post(formAction, params.toString(), {
-      referer: composeUrl,
-    });
-
-    if (response.statusCode >= 400) {
-      throw new MessageSendError(`mbasic send returned HTTP ${response.statusCode}`);
-    }
-
-    log.info({ recipientId }, 'Message sent via mbasic.facebook.com');
   }
 
   private async sendViaLegacyEndpoint(
