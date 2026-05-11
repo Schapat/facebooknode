@@ -65,82 +65,127 @@ LOG_LEVEL=info
 
 ---
 
-## 3. Facebook Automation Service in Coolify deployen
+## 3. Facebook Automation Service in Coolify deployen (Git-basiert)
 
-### Option A: Docker Compose (empfohlen)
+Coolify clont dein Git-Repository und baut das Image automatisch aus dem Dockerfile.
 
-Diese Methode deployt den Service inkl. Redis mit einer einzigen Konfiguration.
+### Schritt 1: Git-Provider in Coolify verbinden
+
+1. Coolify Dashboard → **Settings** → **Git Providers** (oder **Sources**)
+2. Klicke **+ Add** → wähle **GitHub**, **GitLab** oder **Gitea**
+3. Autorisiere Coolify für dein Repository (OAuth oder Deploy Key)
+
+> **Tipp für private Repos:** Du kannst auch einen SSH Deploy Key oder Personal Access Token verwenden.
+
+### Schritt 2: Projekt & Redis anlegen
 
 1. **Neues Projekt erstellen**
    - Coolify Dashboard → **Projects** → **+ Add**
    - Name: `Facebook Automation`
 
-2. **Neue Ressource hinzufügen**
-   - Klicke auf das Projekt → **+ New Resource**
-   - Wähle **Docker Compose**
+2. **Redis erstellen**
+   - Klicke auf das Projekt → **+ New Resource** → **Database** → **Redis**
+   - Name: `fb-redis`
+   - Coolify erstellt den Redis-Container automatisch
+   - Notiere die **interne URL** – sie wird z.B. so aussehen: `redis://fb-redis:6379`
+   - Unter **Settings** kannst du Persistenz (AOF/RDB) aktivieren
 
-3. **Git-Repository verbinden**
-   - Wähle deinen Git-Provider (GitHub/GitLab)
-   - Repository auswählen
+### Schritt 3: Facebook Automation Service deployen
+
+1. **Neue Ressource hinzufügen**
+   - Klicke auf dein Projekt → **+ New Resource** → **Application**
+   - Wähle deinen verbundenen **Git-Provider**
+   - Repository auswählen (z.B. `dein-user/facebooknode`)
    - Branch: `main` (oder dein Deployment-Branch)
-   - Build-Pack: **Docker Compose**
+
+2. **Build-Pack konfigurieren**
+   - **Wichtig:** Coolify wählt standardmäßig **Nixpacks** – das funktioniert hier **nicht**!
+   - Gehe zu **Settings** (oder **General**) → **Build Pack** → ändere auf **Dockerfile**
+   - Dockerfile Location: `Dockerfile` (liegt im Root)
+   - Speichern nicht vergessen
+
+3. **Port konfigurieren**
+   - Unter **Network** → **Ports Exposes**: `3000`
+   - Coolify leitet den Traffic automatisch über seinen Reverse Proxy
 
 4. **Environment Variables setzen**
-   In Coolify unter **Environment Variables** folgende Variablen anlegen:
+   Unter **Environment Variables** folgende Variablen anlegen:
 
    | Variable | Wert | Hinweis |
-   |----------|------|---------|
-   | `API_KEYS` | `dein-sicherer-api-key` | Für API-Authentifizierung |
+   |----------|------|--------|
+   | `PORT` | `3000` | Server-Port |
+   | `HOST` | `0.0.0.0` | Server-Host |
+   | `API_KEYS` | `dein-sicherer-api-key` | API-Authentifizierung |
    | `JWT_SECRET` | `mindestens-32-zeichen-langer-string` | JWT Token Signierung |
    | `ENCRYPTION_KEY` | `mindestens-32-zeichen-langer-string` | AES-256 Session-Verschlüsselung |
+   | `REDIS_URL` | `redis://fb-redis:6379` | Interne Redis-URL (aus Schritt 2) |
+   | `BROWSER_HEADLESS` | `true` | Chromium headless |
    | `MAX_CONCURRENCY` | `2` | Max. gleichzeitige Browser-Jobs |
-   | `LOG_LEVEL` | `info` | Log Level (`debug`, `info`, `warn`, `error`) |
+   | `DEFAULT_TIMEOUT` | `60000` | Operation Timeout (ms) |
+   | `SCREENSHOT_ON_ERROR` | `true` | Screenshots bei Fehlern |
+   | `LOG_LEVEL` | `info` | Log Level |
+   | `DATA_DIR` | `/data` | Daten-Verzeichnis |
 
-5. **Docker Compose Konfiguration anpassen**
-   - Entferne die `version: '3.8'` Zeile (wird von Docker Compose ignoriert)
-   - Stelle sicher, dass Port `3000` exponiert wird
+   > **Tipp:** Markiere sensible Werte als **Secret** (Schloss-Icon), damit sie nicht in Logs erscheinen.
 
-6. **Deploy starten**
-   - Klicke **Deploy**
-   - Warte bis der Build durchläuft (kann 2-5 Min. dauern wegen Chromium)
+5. **Volumes / Persistent Storage**
+   - Unter **Storages** → **+ Add**
+   - Volume-Name: `automation-data`
+   - Destination Path: `/data`
+   - Mount Path: `/data`
+   - So bleiben Sessions, Screenshots und Logs bei Redeployments erhalten
+
+6. **Chromium-Kompatibilität**
+   Keine zusätzliche Konfiguration nötig – Chromium wird bereits mit `--disable-dev-shm-usage` gestartet, sodass kein erhöhter Shared Memory (`shm_size`) benötigt wird.
 
 7. **Domain zuweisen** (optional)
    - Unter **Settings** → **Domains** eine Domain/Subdomain zuweisen
    - z.B. `fb-automation.deine-domain.de`
    - Coolify erstellt automatisch ein SSL-Zertifikat via Let's Encrypt
+   - Falls n8n nur intern zugreift, ist keine öffentliche Domain nötig
 
-### Option B: Einzelnes Dockerfile
+8. **Deploy starten**
+   - Klicke **Deploy**
+   - Coolify clont das Repo, baut das Docker-Image und startet den Container
+   - Der Build dauert beim ersten Mal 3-5 Min. (Chromium-Download)
+   - Logs sind live unter **Deployments** → letztes Deployment einsehbar
 
-Falls du Redis separat betreiben willst:
+9. **Health Check prüfen**
+   - Nach dem Deploy: Rufe `https://fb-automation.deine-domain.de/health` auf
+   - Oder in Coolify: **Logs** → `Server running on 0.0.0.0:3000` sollte erscheinen
 
-1. **Redis deployen**
-   - Neues Projekt → **+ New Resource** → **Database** → **Redis**
-   - Notiere die interne Redis-URL (z.B. `redis://redis-xyz:6379`)
+### Schritt 4: Auto-Deploy einrichten (optional)
 
-2. **Docker Service deployen**
-   - **+ New Resource** → **Dockerfile**
-   - Repository + Branch angeben
-   - Build-Pack: **Dockerfile**
-   - Zusätzliche Env-Variable: `REDIS_URL=redis://dein-redis-host:6379`
+Coolify kann bei jedem Git-Push automatisch redeployen:
+
+1. Unter dem Service → **Webhooks**
+2. Kopiere die Webhook-URL
+3. Füge sie in deinem Git-Repository ein:
+   - **GitHub**: Repository → Settings → Webhooks → Add webhook
+   - **GitLab**: Repository → Settings → Webhooks → Add webhook
+   - Event: `push`
+4. Ab jetzt löst jeder Push auf den konfigurierten Branch ein Redeployment aus
 
 ---
 
 ## 4. n8n in Coolify deployen
 
-Falls du noch keine n8n-Instanz hast, deploye n8n ebenfalls über Coolify:
+Falls du noch keine n8n-Instanz hast, deploye n8n ebenfalls über Coolify.
+
+### Methode A: Docker Image (Standard-n8n)
 
 1. **Neue Ressource hinzufügen**
-   - **+ New Resource** → **Docker Image**
+   - Im selben Projekt → **+ New Resource** → **Docker Image**
    - Image: `docker.n8n.io/n8nio/n8n`
    - Tag: `latest`
 
-2. **Volumes konfigurieren**
-   ```
-   n8n_data:/home/node/.n8n
-   ```
-
-3. **Port setzen**
+2. **Port setzen**
    - Container Port: `5678`
+
+3. **Persistent Storage**
+   - **Storages** → **+ Add**
+   - Volume-Name: `n8n_data`
+   - Mount Path: `/home/node/.n8n`
 
 4. **Environment Variables**
 
@@ -152,12 +197,44 @@ Falls du noch keine n8n-Instanz hast, deploye n8n ebenfalls über Coolify:
    | `WEBHOOK_URL` | `https://n8n.deine-domain.de/` |
    | `N8N_SECURE_COOKIE` | `true` |
    | `GENERIC_TIMEZONE` | `Europe/Berlin` |
-   | `NODE_EXTRA_CA_CERTS` | `/home/node/.n8n/custom-certs/` (optional) |
 
 5. **Domain zuweisen**
    - z.B. `n8n.deine-domain.de`
 
-6. **Deploy** → n8n ist erreichbar unter `https://n8n.deine-domain.de`
+6. **Deploy** → n8n erreichbar unter `https://n8n.deine-domain.de`
+
+### Methode B: Eigenes Git-Repo mit Custom Dockerfile (für vorinstallierten Community Node)
+
+Wenn du den Facebook Automation Node direkt im n8n-Image haben willst:
+
+1. Erstelle ein separates Git-Repo (z.B. `n8n-custom`) mit folgendem Dockerfile:
+
+   ```dockerfile
+   FROM docker.n8n.io/n8nio/n8n:latest
+
+   USER root
+   RUN mkdir -p /home/node/.n8n/nodes/n8n-nodes-facebook-automation
+
+   # Kopiere den gebauten Community Node
+   COPY n8n-node/dist /home/node/.n8n/nodes/n8n-nodes-facebook-automation/dist
+   COPY n8n-node/package.json /home/node/.n8n/nodes/n8n-nodes-facebook-automation/
+   COPY shared-types/dist /home/node/.n8n/nodes/n8n-nodes-facebook-automation/node_modules/@facebook-automation/shared-types/dist
+   COPY shared-types/package.json /home/node/.n8n/nodes/n8n-nodes-facebook-automation/node_modules/@facebook-automation/shared-types/
+
+   WORKDIR /home/node/.n8n/nodes/n8n-nodes-facebook-automation
+   RUN npm install --omit=dev
+
+   USER node
+   WORKDIR /home/node
+   ```
+
+2. In Coolify: **+ New Resource** → **Application** → Git-Provider → dieses Repo
+3. Build-Pack: **Dockerfile**
+4. Setze `N8N_CUSTOM_EXTENSIONS=/home/node/.n8n/nodes` als Environment Variable
+5. Konfiguriere Volumes, Port und Domain wie bei Methode A
+6. **Deploy**
+
+> **Wichtig:** Wenn beide Services im selben Coolify-Projekt liegen, können sie sich über den Container-Namen erreichen (kein öffentlicher Port nötig).
 
 ---
 

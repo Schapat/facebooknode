@@ -1,0 +1,44 @@
+# ============================================
+# Custom n8n image with Facebook Automation node
+# Multi-stage: build from source, no dist/ in git needed
+# ============================================
+
+# --- Stage 1: Build shared-types and n8n-node ---
+FROM node:20-slim AS builder
+
+WORKDIR /build
+
+# Build shared-types
+COPY shared-types/package.json shared-types/tsconfig.json ./shared-types/
+COPY shared-types/src ./shared-types/src
+WORKDIR /build/shared-types
+RUN npm install && npm run build
+
+# Build n8n-node
+WORKDIR /build
+COPY n8n-node/package.json n8n-node/tsconfig.json n8n-node/gulpfile.js ./n8n-node/
+COPY n8n-node/src ./n8n-node/src
+WORKDIR /build/n8n-node
+RUN npm install && npm run build
+
+# --- Stage 2: Custom n8n image ---
+FROM n8nio/n8n:2.10.4
+
+USER root
+
+# Create custom node directory
+RUN mkdir -p /home/node/.n8n/nodes/n8n-nodes-facebook-automation/node_modules/@facebook-automation/shared-types
+
+# Copy built shared-types
+COPY --from=builder /build/shared-types/dist /home/node/.n8n/nodes/n8n-nodes-facebook-automation/node_modules/@facebook-automation/shared-types/dist
+COPY --from=builder /build/shared-types/package.json /home/node/.n8n/nodes/n8n-nodes-facebook-automation/node_modules/@facebook-automation/shared-types/
+
+# Copy built n8n-node
+COPY --from=builder /build/n8n-node/dist /home/node/.n8n/nodes/n8n-nodes-facebook-automation/dist
+COPY --from=builder /build/n8n-node/package.json /home/node/.n8n/nodes/n8n-nodes-facebook-automation/
+
+# Fix ownership
+RUN chown -R node:node /home/node/.n8n/nodes
+
+USER node
+WORKDIR /home/node
