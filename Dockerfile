@@ -75,7 +75,8 @@ COPY --from=builder /app/docker-service/node_modules ./docker-service/node_modul
 
 WORKDIR /app/docker-service
 
-# Install Playwright browsers
+# Install Playwright browsers to a shared location accessible by all users
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN npx playwright install chromium
 
 # Create data directories
@@ -83,7 +84,7 @@ RUN mkdir -p /data/contexts /data/screenshots /data/html-dumps
 
 # Create non-root user
 RUN groupadd -r automation && useradd -r -g automation -G audio,video automation \
-    && chown -R automation:automation /app /data
+    && chown -R automation:automation /app /data /ms-playwright
 
 USER automation
 
