@@ -65,11 +65,12 @@ export class GroupMemberScraper {
     const members: GroupMember[] = [];
     const seenProfiles = new Set<string>();
 
-    // Strategy 1: Extract from embedded JSON relay data
-    const jsonMembers = this.extractFromEmbeddedJson(html, groupName);
+    // Strategy 1: Parse JSON from script tags and walk tree for member nodes
+    const jsonMembers = this.extractFromJsonScripts(html, groupName);
     for (const member of jsonMembers) {
-      if (seenProfiles.has(member.profileUrl)) continue;
-      seenProfiles.add(member.profileUrl);
+      const key = member.profileUrl || member.profileName;
+      if (seenProfiles.has(key)) continue;
+      seenProfiles.add(key);
       members.push(member);
       if (members.length >= maxMembers) break;
     }
@@ -78,8 +79,9 @@ export class GroupMemberScraper {
     if (members.length === 0) {
       const htmlMembers = this.extractFromHtmlLinks(html, groupName);
       for (const member of htmlMembers) {
-        if (seenProfiles.has(member.profileUrl)) continue;
-        seenProfiles.add(member.profileUrl);
+        const key = member.profileUrl || member.profileName;
+        if (seenProfiles.has(key)) continue;
+        seenProfiles.add(key);
         members.push(member);
         if (members.length >= maxMembers) break;
       }
@@ -88,114 +90,158 @@ export class GroupMemberScraper {
     return members;
   }
 
-  private extractFromEmbeddedJson(html: string, groupName: string): GroupMember[] {
+  // ==========================================
+  // Strategy 1: JSON tree walking
+  // ==========================================
+
+  private extractFromJsonScripts(html: string, groupName: string): GroupMember[] {
     const members: GroupMember[] = [];
+    const seenNames = new Set<string>();
 
-    try {
-      // Facebook's relay data contains member info in various JSON structures
-      // Pattern: "user":{"name":"...","url":"...","id":"..."} or similar
+    const scriptRegex = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+    let scriptMatch;
 
-      // Find member nodes with names and profile URLs
-      const memberRegex =
-        /"(?:user|node)"\s*:\s*\{[^{}]*"name"\s*:\s*"([^"]+)"[^{}]*"(?:url|uri)"\s*:\s*"([^"]+)"/g;
-      let match: RegExpExecArray | null;
+    while ((scriptMatch = scriptRegex.exec(html)) !== null) {
+      const content = scriptMatch[1].trim();
+      if (!content || content.length < 200) continue;
+      if (!content.startsWith('{') && !content.startsWith('[')) continue;
 
-      while ((match = memberRegex.exec(html)) !== null) {
-        const name = this.unescapeJson(match[1]);
-        const url = this.unescapeJson(match[2]);
-
-        if (!url.includes('facebook.com') || url.includes('/groups/')) continue;
-        if (!name || name.length < 2) continue;
-
-        members.push({
-          groupName,
-          profileName: name,
-          profileUrl: url,
-          bio: '',
-          location: '',
-          mutualFriends: 0,
-          joinedDate: '',
-        });
+      // Quick pre-filter: only parse scripts that likely contain member data
+      if (!content.includes('User') && !content.includes('member') && !content.includes('profile')) {
+        continue;
       }
 
-      // Alternative pattern: separate name and URL arrays in member list data
-      if (members.length === 0) {
-        // Look for "members_new_forum_members" or "group_members" data
-        const profileRegex =
-          /"(?:__typename)"\s*:\s*"(?:User|GroupMember)"[^}]*"name"\s*:\s*"([^"]+)"[^}]*"(?:url|profile_url)"\s*:\s*"([^"]+)"/g;
-
-        while ((match = profileRegex.exec(html)) !== null) {
-          const name = this.unescapeJson(match[1]);
-          const url = this.unescapeJson(match[2]);
-
-          if (!name || name.length < 2) continue;
-
-          members.push({
-            groupName,
-            profileName: name,
-            profileUrl: url.startsWith('http') ? url : `https://www.facebook.com${url}`,
-            bio: '',
-            location: '',
-            mutualFriends: 0,
-            joinedDate: '',
-          });
-        }
+      try {
+        const data = JSON.parse(content);
+        this.walkJsonForMembers(data, members, seenNames, groupName, 0);
+      } catch {
+        // Not valid JSON
       }
-
-      // Extract additional member data: bio/subtitle text
-      const bioRegex =
-        /"(?:bio_text|subtitle|secondary_text)"\s*:\s*\{\s*"text"\s*:\s*"([^"]+)"/g;
-      const bios: string[] = [];
-      while ((match = bioRegex.exec(html)) !== null) {
-        bios.push(this.unescapeJson(match[1]));
-      }
-
-      // Enrich members with bios if counts match
-      if (bios.length === members.length) {
-        for (let i = 0; i < bios.length; i++) {
-          const bio = bios[i];
-          if (bio.startsWith('Lives in') || bio.startsWith('From')) {
-            members[i].location = bio.replace(/^(?:Lives in|From)\s*/i, '');
-          } else if (bio.includes('Joined')) {
-            members[i].joinedDate = bio;
-          } else {
-            members[i].bio = bio;
-          }
-        }
-      }
-
-      // Extract mutual friends count
-      const mutualRegex = /"mutual_friends"\s*:\s*\{\s*"count"\s*:\s*(\d+)/g;
-      const mutualCounts: number[] = [];
-      while ((match = mutualRegex.exec(html)) !== null) {
-        mutualCounts.push(parseInt(match[1], 10));
-      }
-
-      if (mutualCounts.length === members.length) {
-        for (let i = 0; i < mutualCounts.length; i++) {
-          members[i].mutualFriends = mutualCounts[i];
-        }
-      }
-    } catch (error) {
-      log.debug({ error }, 'Failed to extract members from embedded JSON');
     }
 
+    log.debug({ count: members.length }, 'Members found via JSON tree walking');
     return members;
   }
+
+  private walkJsonForMembers(
+    obj: unknown,
+    members: GroupMember[],
+    seenNames: Set<string>,
+    groupName: string,
+    depth: number,
+  ): void {
+    if (depth > 40 || !obj) return;
+
+    // Handle embedded JSON strings
+    if (typeof obj === 'string') {
+      if (obj.length > 100 && (obj.startsWith('{') || obj.startsWith('['))) {
+        try {
+          const parsed = JSON.parse(obj);
+          this.walkJsonForMembers(parsed, members, seenNames, groupName, depth + 1);
+        } catch { /* not JSON */ }
+      }
+      return;
+    }
+
+    if (typeof obj !== 'object') return;
+
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        this.walkJsonForMembers(item, members, seenNames, groupName, depth + 1);
+      }
+      return;
+    }
+
+    const record = obj as Record<string, unknown>;
+
+    // Check if this looks like a User node with name + URL
+    const member = this.tryExtractMember(record, groupName);
+    if (member && !seenNames.has(member.profileName + '|' + member.profileUrl)) {
+      seenNames.add(member.profileName + '|' + member.profileUrl);
+      members.push(member);
+    }
+
+    // Continue walking
+    for (const value of Object.values(record)) {
+      this.walkJsonForMembers(value, members, seenNames, groupName, depth + 1);
+    }
+  }
+
+  private tryExtractMember(obj: Record<string, unknown>, groupName: string): GroupMember | null {
+    // A member node should be a User-typed object with name + URL
+    const typename = obj.__typename;
+    if (typename !== 'User' && typename !== 'GroupMember') return null;
+
+    const name = typeof obj.name === 'string' ? obj.name : '';
+    if (!name || name.length < 2) return null;
+
+    let url = '';
+    if (typeof obj.url === 'string') url = obj.url;
+    else if (typeof obj.uri === 'string') url = obj.uri;
+    else if (typeof obj.profile_url === 'string') url = obj.profile_url;
+
+    // Skip if URL points to a group, page, etc.
+    if (url.includes('/groups/') || url.includes('/pages/')) return null;
+
+    // Extract optional fields from this node's subtree
+    const bio = this.findStringField(obj, ['bio_text', 'bio', 'subtitle', 'secondary_text']);
+    const joinDate = this.findStringField(obj, ['membership', 'join_status_text']);
+
+    let location = '';
+    let bioText = '';
+    if (bio) {
+      if (bio.startsWith('Lives in') || bio.startsWith('From')) {
+        location = bio.replace(/^(?:Lives in|From)\s*/i, '');
+      } else {
+        bioText = bio;
+      }
+    }
+
+    // Extract mutual friends count
+    let mutualFriends = 0;
+    if (obj.mutual_friends && typeof obj.mutual_friends === 'object') {
+      const mf = obj.mutual_friends as Record<string, unknown>;
+      if (typeof mf.count === 'number') mutualFriends = mf.count;
+    }
+
+    return {
+      groupName,
+      profileName: name,
+      profileUrl: url.startsWith('http') ? url : url ? `https://www.facebook.com${url}` : '',
+      bio: bioText,
+      location,
+      mutualFriends,
+      joinedDate: joinDate || '',
+    };
+  }
+
+  private findStringField(obj: Record<string, unknown>, keys: string[]): string {
+    for (const key of keys) {
+      const val = obj[key];
+      if (typeof val === 'string' && val.length > 0) return val;
+      if (val && typeof val === 'object' && !Array.isArray(val)) {
+        const nested = val as Record<string, unknown>;
+        if (typeof nested.text === 'string' && nested.text.length > 0) return nested.text;
+      }
+    }
+    return '';
+  }
+
+  // ==========================================
+  // Strategy 2: HTML link extraction
+  // ==========================================
 
   private extractFromHtmlLinks(html: string, groupName: string): GroupMember[] {
     const members: GroupMember[] = [];
 
-    // Find profile links - Facebook profile URLs follow known patterns
     const profileRegex =
       /href="(https?:\/\/www\.facebook\.com\/(?:profile\.php\?id=\d+|[a-zA-Z0-9.]+))"/g;
     const seenUrls = new Set<string>();
-    let match: RegExpExecArray | null;
+    let match;
 
     while ((match = profileRegex.exec(html)) !== null) {
       const url = match[1];
 
-      // Skip non-profile links
       if (
         url.includes('/groups/') ||
         url.includes('/pages/') ||
@@ -230,6 +276,10 @@ export class GroupMemberScraper {
 
     return members;
   }
+
+  // ==========================================
+  // Utility methods
+  // ==========================================
 
   private extractGroupName(html: string): string {
     const jsonMatch = html.match(/"group"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/);

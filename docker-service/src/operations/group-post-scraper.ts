@@ -50,12 +50,13 @@ export class GroupPostScraper {
     }
 
     const groupName = this.extractGroupName(response.body);
+    const groupSlug = normalizedUrl.match(/groups\/([^/?]+)/)?.[1] || '';
     const maxPosts = input.maxPosts || 100;
     const cutoffTimestamp = input.lastScrapeTimestamp
       ? new Date(input.lastScrapeTimestamp).getTime()
       : 0;
 
-    const posts = this.parsePostsFromHtml(response.body, groupName, normalizedUrl, maxPosts, cutoffTimestamp);
+    const posts = this.parsePostsFromHtml(response.body, groupName, groupSlug, maxPosts, cutoffTimestamp);
     log.info({ groupName, postsCount: posts.length }, 'Group scraping complete');
     return posts;
   }
@@ -63,15 +64,15 @@ export class GroupPostScraper {
   private parsePostsFromHtml(
     html: string,
     groupName: string,
-    groupUrl: string,
+    groupSlug: string,
     maxPosts: number,
     cutoffTimestamp: number,
   ): GroupPost[] {
     const posts: GroupPost[] = [];
     const seenIds = new Set<string>();
 
-    // Strategy 1: Parse embedded JSON data (Facebook embeds relay data as JSON in script tags)
-    const jsonPosts = this.extractFromEmbeddedJson(html, groupName);
+    // Strategy 1: Parse JSON from script tags and walk tree for story nodes
+    const jsonPosts = this.extractFromJsonScripts(html, groupName, groupSlug);
     for (const post of jsonPosts) {
       if (seenIds.has(post.postId)) continue;
       seenIds.add(post.postId);
@@ -85,12 +86,18 @@ export class GroupPostScraper {
       if (posts.length >= maxPosts) break;
     }
 
-    // Strategy 2: Fallback - extract post links and basic data from HTML
+    // Strategy 2: Context-based extraction around post permalink IDs
     if (posts.length === 0) {
-      const htmlPosts = this.extractFromHtmlStructure(html, groupName, groupUrl);
-      for (const post of htmlPosts) {
+      const contextPosts = this.extractByPostContext(html, groupName, groupSlug);
+      for (const post of contextPosts) {
         if (seenIds.has(post.postId)) continue;
         seenIds.add(post.postId);
+
+        if (cutoffTimestamp > 0 && post.createdAt) {
+          const postTime = new Date(post.createdAt).getTime();
+          if (!isNaN(postTime) && postTime < cutoffTimestamp) continue;
+        }
+
         posts.push(post);
         if (posts.length >= maxPosts) break;
       }
@@ -99,163 +106,389 @@ export class GroupPostScraper {
     return posts;
   }
 
-  private extractFromEmbeddedJson(html: string, groupName: string): GroupPost[] {
+  // ==========================================
+  // Strategy 1: JSON tree walking
+  // ==========================================
+
+  private extractFromJsonScripts(html: string, groupName: string, groupSlug: string): GroupPost[] {
     const posts: GroupPost[] = [];
+    const seenIds = new Set<string>();
 
-    try {
-      // Facebook embeds data as JSON in script tags or as require() calls
-      // Look for story/post data in various JSON patterns
+    const scriptRegex = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+    let scriptMatch;
 
-      // Pattern: "story_id":"..." or "post_id":"..."
-      const storyIdRegex = /"(?:story_id|post_id)"\s*:\s*"(\d+)"/g;
-      const storyIds = new Set<string>();
-      let match: RegExpExecArray | null;
-      while ((match = storyIdRegex.exec(html)) !== null) {
-        storyIds.add(match[1]);
+    while ((scriptMatch = scriptRegex.exec(html)) !== null) {
+      const content = scriptMatch[1].trim();
+      if (!content || content.length < 200) continue;
+      if (!content.startsWith('{') && !content.startsWith('[')) continue;
+
+      // Quick pre-filter: only parse scripts that might contain post data
+      if (
+        !content.includes('post_id') &&
+        !content.includes('story_id') &&
+        !content.includes('creation_time')
+      ) {
+        continue;
       }
 
-      // Pattern: Look for message/text content near post IDs
-      // Facebook's relay data contains "message":{"text":"..."} objects
-      const messageRegex = /"message"\s*:\s*\{\s*"text"\s*:\s*"([^"]*(?:\\.[^"]*)*)"/g;
-      const messages: string[] = [];
-      while ((match = messageRegex.exec(html)) !== null) {
-        messages.push(this.unescapeJson(match[1]));
+      try {
+        const data = JSON.parse(content);
+        this.walkJsonForPosts(data, posts, seenIds, groupName, groupSlug, 0);
+      } catch {
+        // Not valid JSON, skip
       }
-
-      // Pattern: Author names from "name":"..." near actor/author contexts
-      const actorRegex = /"(?:actor|author)"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/g;
-      const authors: Array<{ name: string }> = [];
-      while ((match = actorRegex.exec(html)) !== null) {
-        authors.push({ name: this.unescapeJson(match[1]) });
-      }
-
-      // Pattern: Timestamps - creation_time is Unix epoch seconds
-      const timeRegex = /"creation_time"\s*:\s*(\d{10,})/g;
-      const timestamps: number[] = [];
-      while ((match = timeRegex.exec(html)) !== null) {
-        timestamps.push(parseInt(match[1], 10));
-      }
-
-      // Pattern: Reaction counts
-      const reactionRegex = /"reaction_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)/g;
-      const reactions: number[] = [];
-      while ((match = reactionRegex.exec(html)) !== null) {
-        reactions.push(parseInt(match[1], 10));
-      }
-
-      // Pattern: Comment counts
-      const commentRegex = /"comment_count"\s*:\s*\{\s*"total_count"\s*:\s*(\d+)/g;
-      const commentCounts: number[] = [];
-      while ((match = commentRegex.exec(html)) !== null) {
-        commentCounts.push(parseInt(match[1], 10));
-      }
-
-      // Pattern: URLs - permalink_url or post URL
-      const urlRegex = /"(?:permalink_url|url)"\s*:\s*"(https?:\\\/\\\/www\.facebook\.com\\\/groups\\\/[^"]+)"/g;
-      const urls: string[] = [];
-      while ((match = urlRegex.exec(html)) !== null) {
-        urls.push(this.unescapeJson(match[1]));
-      }
-
-      // Combine: Try to build coherent post objects
-      const storyIdArray = [...storyIds];
-      const count = Math.min(storyIdArray.length, messages.length || storyIdArray.length);
-
-      for (let i = 0; i < count; i++) {
-        const post: GroupPost = {
-          groupName,
-          postId: storyIdArray[i] || `unknown-${i}`,
-          authorName: authors[i]?.name || 'Unknown',
-          authorProfileUrl: '',
-          title: '',
-          content: messages[i] || '',
-          createdAt: timestamps[i]
-            ? new Date(timestamps[i] * 1000).toISOString()
-            : new Date().toISOString(),
-          likes: reactions[i] || 0,
-          comments: commentCounts[i] || 0,
-          postUrl: urls[i] || '',
-        };
-
-        if (post.content || post.postUrl) {
-          posts.push(post);
-        }
-      }
-    } catch (error) {
-      log.debug({ error }, 'Failed to extract from embedded JSON');
     }
 
+    log.debug({ count: posts.length }, 'Posts found via JSON tree walking');
     return posts;
   }
 
-  private extractFromHtmlStructure(html: string, groupName: string, groupUrl: string): GroupPost[] {
+  private walkJsonForPosts(
+    obj: unknown,
+    posts: GroupPost[],
+    seenIds: Set<string>,
+    groupName: string,
+    groupSlug: string,
+    depth: number,
+  ): void {
+    if (depth > 40 || !obj) return;
+
+    // Handle embedded JSON strings (Facebook double-encodes some relay data)
+    if (typeof obj === 'string') {
+      if (obj.length > 100 && (obj.startsWith('{') || obj.startsWith('['))) {
+        try {
+          const parsed = JSON.parse(obj);
+          this.walkJsonForPosts(parsed, posts, seenIds, groupName, groupSlug, depth + 1);
+        } catch { /* not JSON */ }
+      }
+      return;
+    }
+
+    if (typeof obj !== 'object') return;
+
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        this.walkJsonForPosts(item, posts, seenIds, groupName, groupSlug, depth + 1);
+      }
+      return;
+    }
+
+    const record = obj as Record<string, unknown>;
+
+    // Check if this node has a post_id with meaningful content
+    const postId = this.getPostId(record);
+    if (postId && !seenIds.has(postId)) {
+      const post = this.buildPostFromNode(record, postId, groupName, groupSlug);
+      if (post) {
+        seenIds.add(postId);
+        posts.push(post);
+      }
+    }
+
+    // Continue walking child values to find more posts
+    for (const value of Object.values(record)) {
+      this.walkJsonForPosts(value, posts, seenIds, groupName, groupSlug, depth + 1);
+    }
+  }
+
+  private getPostId(obj: Record<string, unknown>): string | null {
+    for (const key of ['post_id', 'story_id', 'legacy_story_id']) {
+      const val = obj[key];
+      if (typeof val === 'string' && /^\d+$/.test(val)) return val;
+    }
+    return null;
+  }
+
+  private buildPostFromNode(
+    obj: Record<string, unknown>,
+    postId: string,
+    groupName: string,
+    groupSlug: string,
+  ): GroupPost | null {
+    // Search within THIS node's subtree for all post data
+    const message = this.deepFindMessageText(obj);
+    const creationTime = this.deepFindNumber(obj, 'creation_time');
+
+    // Only create a post if we have meaningful data (not just a bare reference)
+    if (!message && !creationTime) return null;
+
+    const author = this.deepFindAuthor(obj);
+    const likes = this.deepFindNestedCount(obj, 'reaction_count', 'count');
+    const comments =
+      this.deepFindNestedCount(obj, 'comment_count', 'total_count') ??
+      this.deepFindNumber(obj, 'total_comment_count');
+
+    return {
+      groupName,
+      postId,
+      authorName: author?.name || 'Unknown',
+      authorProfileUrl: author?.url || '',
+      title: '',
+      content: message || '',
+      createdAt: creationTime
+        ? new Date(creationTime * 1000).toISOString()
+        : new Date().toISOString(),
+      likes: likes ?? 0,
+      comments: comments ?? 0,
+      postUrl: `https://www.facebook.com/groups/${groupSlug}/posts/${postId}`,
+    };
+  }
+
+  // ---- Deep-find helpers (search within a single node's subtree) ----
+
+  private deepFindMessageText(obj: unknown, depth = 0): string | null {
+    if (depth > 20 || !obj || typeof obj !== 'object') return null;
+
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        const r = this.deepFindMessageText(item, depth + 1);
+        if (r) return r;
+      }
+      return null;
+    }
+
+    const record = obj as Record<string, unknown>;
+
+    // Check if this object has message.text
+    if (record.message && typeof record.message === 'object' && !Array.isArray(record.message)) {
+      const msg = record.message as Record<string, unknown>;
+      if (typeof msg.text === 'string' && msg.text.length > 0) {
+        return msg.text;
+      }
+    }
+
+    for (const value of Object.values(record)) {
+      const r = this.deepFindMessageText(value, depth + 1);
+      if (r) return r;
+    }
+    return null;
+  }
+
+  private deepFindNumber(obj: unknown, key: string, depth = 0): number | null {
+    if (depth > 20 || !obj || typeof obj !== 'object') return null;
+
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        const r = this.deepFindNumber(item, key, depth + 1);
+        if (r !== null) return r;
+      }
+      return null;
+    }
+
+    const record = obj as Record<string, unknown>;
+    if (key in record && typeof record[key] === 'number') {
+      return record[key] as number;
+    }
+
+    for (const value of Object.values(record)) {
+      const r = this.deepFindNumber(value, key, depth + 1);
+      if (r !== null) return r;
+    }
+    return null;
+  }
+
+  private deepFindAuthor(obj: unknown, depth = 0): { name: string; url: string } | null {
+    if (depth > 20 || !obj || typeof obj !== 'object') return null;
+
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        const r = this.deepFindAuthor(item, depth + 1);
+        if (r) return r;
+      }
+      return null;
+    }
+
+    const record = obj as Record<string, unknown>;
+
+    // Check actors array (most common Facebook pattern)
+    if (Array.isArray(record.actors) && record.actors.length > 0) {
+      const actor = record.actors[0] as Record<string, unknown>;
+      if (typeof actor.name === 'string' && actor.name.length > 1) {
+        return {
+          name: actor.name,
+          url: typeof actor.url === 'string' ? actor.url : '',
+        };
+      }
+    }
+
+    // Check actor object
+    if (record.actor && typeof record.actor === 'object' && !Array.isArray(record.actor)) {
+      const actor = record.actor as Record<string, unknown>;
+      if (typeof actor.name === 'string' && actor.name.length > 1) {
+        return {
+          name: actor.name,
+          url: typeof actor.url === 'string' ? actor.url : '',
+        };
+      }
+    }
+
+    // Check author object
+    if (record.author && typeof record.author === 'object' && !Array.isArray(record.author)) {
+      const author = record.author as Record<string, unknown>;
+      if (typeof author.name === 'string' && author.name.length > 1) {
+        return {
+          name: author.name,
+          url: typeof author.url === 'string' ? author.url : '',
+        };
+      }
+    }
+
+    for (const value of Object.values(record)) {
+      const r = this.deepFindAuthor(value, depth + 1);
+      if (r) return r;
+    }
+    return null;
+  }
+
+  private deepFindNestedCount(
+    obj: unknown,
+    parentKey: string,
+    countKey: string,
+    depth = 0,
+  ): number | null {
+    if (depth > 20 || !obj || typeof obj !== 'object') return null;
+
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        const r = this.deepFindNestedCount(item, parentKey, countKey, depth + 1);
+        if (r !== null) return r;
+      }
+      return null;
+    }
+
+    const record = obj as Record<string, unknown>;
+    if (record[parentKey] && typeof record[parentKey] === 'object') {
+      const parent = record[parentKey] as Record<string, unknown>;
+      if (typeof parent[countKey] === 'number') {
+        return parent[countKey] as number;
+      }
+    }
+
+    for (const value of Object.values(record)) {
+      const r = this.deepFindNestedCount(value, parentKey, countKey, depth + 1);
+      if (r !== null) return r;
+    }
+    return null;
+  }
+
+  // ==========================================
+  // Strategy 2: Context-based extraction
+  // ==========================================
+
+  private extractByPostContext(html: string, groupName: string, groupSlug: string): GroupPost[] {
     const posts: GroupPost[] = [];
 
-    // Find all post/permalink links
-    const postLinkRegex = /\/(?:groups\/[^/]+\/(?:posts|permalink)\/(\d+))/g;
+    // Find post IDs from permalink URLs
+    const postLinkRegex = /\/groups\/[^/]+\/(?:posts|permalink)\/(\d+)/g;
     const postIds = new Set<string>();
-    let match: RegExpExecArray | null;
+    let match;
     while ((match = postLinkRegex.exec(html)) !== null) {
       postIds.add(match[1]);
     }
 
-    log.debug({ count: postIds.size }, 'Found post IDs from HTML links');
+    // Also find post_id values from JSON patterns
+    const postIdJsonRegex = /"post_id"\s*:\s*"(\d+)"/g;
+    while ((match = postIdJsonRegex.exec(html)) !== null) {
+      postIds.add(match[1]);
+    }
+
+    log.debug({ count: postIds.size }, 'Post IDs for context extraction');
 
     for (const postId of postIds) {
-      // Try to extract content around this post ID
-      const postIdEscaped = postId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const contextRegex = new RegExp(
-        `[\\s\\S]{0,3000}${postIdEscaped}[\\s\\S]{0,3000}`,
-      );
-      const contextMatch = html.match(contextRegex);
-      const block = contextMatch?.[0] || '';
+      const idRegex = new RegExp(postId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+      let bestPost: GroupPost | null = null;
+      let bestScore = 0;
 
-      // Try to get text content near this ID
-      const textMatch = block.match(/"text"\s*:\s*"([^"]{10,}(?:\\.[^"]*)*)"/);
-      const content = textMatch ? this.unescapeJson(textMatch[1]) : '';
+      let idMatch;
+      while ((idMatch = idRegex.exec(html)) !== null) {
+        const start = Math.max(0, idMatch.index - 8000);
+        const end = Math.min(html.length, idMatch.index + 8000);
+        const context = html.substring(start, end);
 
-      const nameMatch = block.match(/"name"\s*:\s*"([^"]+)"/);
-      const authorName = nameMatch ? this.unescapeJson(nameMatch[1]) : 'Unknown';
+        const post = this.extractPostFromContext(context, postId, groupName, groupSlug);
+        if (post) {
+          let score = 0;
+          if (post.content) score += 3;
+          if (post.authorName !== 'Unknown') score += 2;
+          if (post.likes > 0) score += 1;
+          if (post.comments > 0) score += 1;
+          if (score > bestScore) {
+            bestScore = score;
+            bestPost = post;
+          }
+        }
+      }
 
-      const timeMatch = block.match(/"creation_time"\s*:\s*(\d{10,})/);
-      const createdAt = timeMatch
-        ? new Date(parseInt(timeMatch[1], 10) * 1000).toISOString()
-        : new Date().toISOString();
-
-      const groupSlug = groupUrl.match(/groups\/([^/?]+)/)?.[1] || '';
-
-      const post: GroupPost = {
-        groupName,
-        postId,
-        authorName,
-        authorProfileUrl: '',
-        title: '',
-        content,
-        createdAt,
-        likes: 0,
-        comments: 0,
-        postUrl: `https://www.facebook.com/groups/${groupSlug}/posts/${postId}`,
-      };
-
-      posts.push(post);
+      if (bestPost) {
+        posts.push(bestPost);
+      }
     }
 
     return posts;
   }
 
+  private extractPostFromContext(
+    context: string,
+    postId: string,
+    groupName: string,
+    groupSlug: string,
+  ): GroupPost | null {
+    const textMatch = context.match(/"message"\s*:\s*\{\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    const content = textMatch ? this.unescapeJson(textMatch[1]) : '';
+
+    let authorName = 'Unknown';
+    let authorUrl = '';
+    const actorMatch = context.match(
+      /"(?:actors?|author)"\s*:\s*\[?\s*\{[^}]*?"name"\s*:\s*"((?:[^"\\]|\\.)*)"/,
+    );
+    if (actorMatch) authorName = this.unescapeJson(actorMatch[1]);
+
+    const urlMatch = context.match(
+      /"(?:actors?|author)"\s*:\s*\[?\s*\{[^}]*?"url"\s*:\s*"((?:[^"\\]|\\.)*)"/,
+    );
+    if (urlMatch) authorUrl = this.unescapeJson(urlMatch[1]);
+
+    const timeMatch = context.match(/"creation_time"\s*:\s*(\d{10,})/);
+    const createdAt = timeMatch
+      ? new Date(parseInt(timeMatch[1], 10) * 1000).toISOString()
+      : new Date().toISOString();
+
+    const reactionMatch = context.match(/"reaction_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)/);
+    const likes = reactionMatch ? parseInt(reactionMatch[1], 10) : 0;
+
+    const commentMatch = context.match(/"comment_count"\s*:\s*\{\s*"total_count"\s*:\s*(\d+)/);
+    const comments = commentMatch ? parseInt(commentMatch[1], 10) : 0;
+
+    if (!content && !timeMatch) return null;
+
+    return {
+      groupName,
+      postId,
+      authorName,
+      authorProfileUrl: authorUrl,
+      title: '',
+      content,
+      createdAt,
+      likes,
+      comments,
+      postUrl: `https://www.facebook.com/groups/${groupSlug}/posts/${postId}`,
+    };
+  }
+
+  // ==========================================
+  // Utility methods
+  // ==========================================
+
   private extractGroupName(html: string): string {
-    // Try JSON pattern first
     const jsonMatch = html.match(/"group"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/);
     if (jsonMatch) return this.unescapeJson(jsonMatch[1]);
 
-    // Try <title> tag
     const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
     if (titleMatch) {
       const title = titleMatch[1].replace(/\s*\|\s*Facebook.*$/, '').trim();
       if (title && title !== 'Facebook') return this.decodeHtmlEntities(title);
     }
 
-    // Try og:title meta tag
     const ogMatch = html.match(/property="og:title"\s+content="([^"]+)"/i);
     if (ogMatch) return this.decodeHtmlEntities(ogMatch[1]);
 
