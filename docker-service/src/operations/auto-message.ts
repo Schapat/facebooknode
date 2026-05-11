@@ -486,74 +486,156 @@ export class AutoMessage {
       errors.push(`mbasic: ${msg}`);
     }
 
+    // Strategy 2: m.facebook.com (mobile web — different from mbasic)
+    try {
+      await this.sendViaMobileSite(recipientId, message);
+      return;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      log.warn({ error: msg }, 'Mobile site send failed, trying next strategy');
+      errors.push(`mobile: ${msg}`);
+    }
+
     if (!tokens.fbDtsg) {
       throw new MessageSendError(`All message send strategies failed (no fb_dtsg for API calls): ${errors.join('; ')}`);
     }
 
-    // Strategy 2: GraphQL API
+    // Strategy 3: GraphQL API (doc_id extracted dynamically)
     try {
       await this.sendViaGraphQL(recipientId, myUserId, message, tokens);
       return;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      log.warn({ error: msg }, 'GraphQL send failed, trying next strategy');
+      log.warn({ error: msg }, 'GraphQL send failed');
       errors.push(`graphql: ${msg}`);
-    }
-
-    // Strategy 3: Legacy /messaging/send/ endpoint
-    try {
-      await this.sendViaLegacyEndpoint(recipientId, myUserId, message, tokens);
-      return;
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      log.warn({ error: msg }, 'Legacy send failed');
-      errors.push(`legacy: ${msg}`);
     }
 
     throw new MessageSendError(`All message send strategies failed: ${errors.join('; ')}`);
   }
 
+  /**
+   * Find a POST form on an mbasic/mobile page.
+   * Returns the form action or null. Tries multiple patterns to handle
+   * Facebook page structure changes.
+   */
+  private findPostForm(body: string): string | null {
+    // Pattern 1: form action starts with /messages/
+    const msgFormPatterns = [
+      /<form[^>]*action="(\/messages\/[^"]*)"[^>]*method="post"/i,
+      /<form[^>]*method="post"[^>]*action="(\/messages\/[^"]*)"/i,
+    ];
+    for (const pattern of msgFormPatterns) {
+      const match = body.match(pattern);
+      if (match) return match[1];
+    }
+
+    // Pattern 2: any POST form that contains a textarea or input[name="body"]
+    // (the message compose form always has a body field)
+    const formBlocks = body.match(/<form[^>]*method="post"[^>]*>[\s\S]*?<\/form>/gi) ||
+      body.match(/<form[^>]*method="post"[^>]*>[\s\S]*?(?=<form|$)/gi) || [];
+    for (const formBlock of formBlocks) {
+      if (formBlock.includes('name="body"') || formBlock.match(/<textarea[^>]*name="body"/i)) {
+        const actionMatch = formBlock.match(/<form[^>]*action="([^"]*)"/i);
+        if (actionMatch) return actionMatch[1];
+      }
+    }
+
+    // Pattern 3: any POST form with an action URL (last resort)
+    const anyFormMatch = body.match(/<form[^>]*action="(\/[^"]*)"[^>]*method="post"/i) ||
+      body.match(/<form[^>]*method="post"[^>]*action="(\/[^"]*)"/i);
+    if (anyFormMatch) {
+      const action = anyFormMatch[1];
+      // Verify it's not a login or settings form
+      if (!action.includes('/login') && !action.includes('/settings') && !action.includes('/checkpoint')) {
+        return action;
+      }
+    }
+
+    return null;
+  }
+
   private async sendViaMbasic(recipientId: string, message: string): Promise<void> {
     log.info({ recipientId }, 'Sending message via mbasic.facebook.com');
 
-    // Step 1: Load the compose page to get the form and hidden fields
-    const composeUrl = `https://mbasic.facebook.com/messages/compose/?ids=${recipientId}`;
+    // Try multiple mbasic URLs in order
+    const mbasicUrls = [
+      `https://mbasic.facebook.com/messages/compose/?ids=${recipientId}`,
+      `https://mbasic.facebook.com/messages/thread/${recipientId}/`,
+      `https://mbasic.facebook.com/messages/read/?tid=cid.c.${recipientId}%3A${this.httpClient.getUserId()}`,
+    ];
+
+    for (const url of mbasicUrls) {
+      log.debug({ url }, 'Trying mbasic URL');
+
+      try {
+        const page = await this.httpClient.request(url, {
+          referer: 'https://mbasic.facebook.com/messages/',
+        });
+
+        if (this.httpClient.isLoginPage(page.body)) {
+          throw new MessageSendError('Session not valid on mbasic (login page)');
+        }
+
+        const formAction = this.findPostForm(page.body);
+        if (formAction) {
+          log.info({ url, formAction }, 'Found message form on mbasic');
+          return this.submitMbasicForm(page.body, formAction, message, url);
+        }
+
+        log.debug({ url, bodyLength: page.body.length }, 'No message form found on this mbasic URL');
+      } catch (error) {
+        if (error instanceof MessageSendError && (error.message.includes('login page') || error.message.includes('mbasic send returned'))) {
+          throw error;
+        }
+        log.debug({ error: error instanceof Error ? error.message : String(error), url }, 'mbasic URL attempt failed');
+      }
+    }
+
+    // Log page content for debugging
+    try {
+      const debugPage = await this.httpClient.request(mbasicUrls[0], {
+        referer: 'https://mbasic.facebook.com/',
+      });
+      log.debug({
+        bodySnippet: debugPage.body.substring(0, 3000),
+        bodyLength: debugPage.body.length,
+        allForms: (debugPage.body.match(/<form[^>]*>/gi) || []).map((f: string) => f.substring(0, 200)),
+      }, 'mbasic compose page debug info');
+    } catch { /* ignore */ }
+
+    throw new MessageSendError('No message form found on any mbasic page');
+  }
+
+  private async sendViaMobileSite(recipientId: string, message: string): Promise<void> {
+    log.info({ recipientId }, 'Sending message via m.facebook.com');
+
+    // m.facebook.com has a different compose interface than mbasic
+    const composeUrl = `https://m.facebook.com/messages/compose/?ids=${recipientId}`;
     const page = await this.httpClient.request(composeUrl, {
-      referer: 'https://mbasic.facebook.com/',
+      referer: 'https://m.facebook.com/messages/',
     });
 
     if (this.httpClient.isLoginPage(page.body)) {
-      throw new MessageSendError('Session not valid on mbasic (login page)');
+      throw new MessageSendError('Session not valid on m.facebook.com (login page)');
     }
 
-    // Step 2: Find the message send form (try multiple patterns)
-    const formMatch =
-      page.body.match(/<form[^>]*action="(\/messages\/[^"]*)"[^>]*method="post"/i) ||
-      page.body.match(/<form[^>]*method="post"[^>]*action="(\/messages\/[^"]*)"/i) ||
-      page.body.match(/<form[^>]*action="(\/messages\/send\/[^"]*)"[^>]*/i);
-
-    if (!formMatch) {
-      // Try alternate compose URL: direct thread
-      const threadUrl = `https://mbasic.facebook.com/messages/read/?tid=cid.c.${recipientId}%3A${this.httpClient.getUserId()}`;
-      log.debug({ threadUrl }, 'No compose form found, trying thread URL');
-
-      const threadPage = await this.httpClient.request(threadUrl, {
-        referer: 'https://mbasic.facebook.com/messages/',
-      });
-
-      const threadFormMatch =
-        threadPage.body.match(/<form[^>]*action="(\/messages\/[^"]*)"[^>]*method="post"/i) ||
-        threadPage.body.match(/<form[^>]*method="post"[^>]*action="(\/messages\/[^"]*)"/i);
-
-      if (!threadFormMatch) {
-        log.debug({ bodySnippet: page.body.substring(0, 2000) }, 'mbasic compose page preview');
-        throw new MessageSendError('No message form found on mbasic compose or thread page');
-      }
-
-      return this.submitMbasicForm(threadPage.body, threadFormMatch[1], message, threadUrl);
+    const formAction = this.findPostForm(page.body);
+    if (formAction) {
+      return this.submitMbasicForm(page.body, formAction, message, composeUrl);
     }
 
-    return this.submitMbasicForm(page.body, formMatch[1], message, composeUrl);
+    // Try thread URL on m.facebook.com
+    const threadUrl = `https://m.facebook.com/messages/read/?tid=cid.c.${recipientId}%3A${this.httpClient.getUserId()}`;
+    const threadPage = await this.httpClient.request(threadUrl, {
+      referer: 'https://m.facebook.com/messages/',
+    });
+
+    const threadFormAction = this.findPostForm(threadPage.body);
+    if (threadFormAction) {
+      return this.submitMbasicForm(threadPage.body, threadFormAction, message, threadUrl);
+    }
+
+    throw new MessageSendError('No message form found on m.facebook.com');
   }
 
   private async submitMbasicForm(
@@ -563,8 +645,13 @@ export class AutoMessage {
     referer: string,
   ): Promise<void> {
     let formAction = rawFormAction.replace(/&amp;/g, '&');
+
+    // Determine the base URL from the referer
+    const refererUrl = new URL(referer);
+    const baseUrl = `${refererUrl.protocol}//${refererUrl.hostname}`;
+
     if (!formAction.startsWith('http')) {
-      formAction = `https://mbasic.facebook.com${formAction}`;
+      formAction = `${baseUrl}${formAction}`;
     }
 
     // Extract hidden input fields from the form
@@ -587,10 +674,24 @@ export class AutoMessage {
     params.append('body', message);
 
     // Extract submit button value (German: "Senden", English: "Send", etc.)
-    const submitMatch = pageBody.match(/<input[^>]*name="send"[^>]*value="([^"]*)"/i);
-    params.append('send', submitMatch ? submitMatch[1] : 'Senden');
+    const submitMatch =
+      pageBody.match(/<input[^>]*name="send"[^>]*value="([^"]*)"/i) ||
+      pageBody.match(/<button[^>]*name="send"[^>]*value="([^"]*)"/i);
+    if (submitMatch) {
+      params.append('send', submitMatch[1]);
+    } else {
+      // Try common submit button names
+      const altSubmit =
+        pageBody.match(/<input[^>]*type="submit"[^>]*name="([^"]*)"[^>]*value="([^"]*)"/i) ||
+        pageBody.match(/<button[^>]*type="submit"[^>]*name="([^"]*)"[^>]*value="([^"]*)"/i);
+      if (altSubmit) {
+        params.append(altSubmit[1], altSubmit[2]);
+      } else {
+        params.append('send', 'Senden');
+      }
+    }
 
-    log.debug({ formAction, hiddenFieldCount: [...params.keys()].length }, 'Submitting mbasic message form');
+    log.debug({ formAction, hiddenFieldCount: [...params.keys()].length }, 'Submitting message form');
 
     const response = await this.httpClient.post(formAction, params.toString(), {
       referer,
@@ -601,15 +702,18 @@ export class AutoMessage {
     }
 
     // Check for success indicators
-    const hasThread = response.body.includes('/messages/read/') || response.body.includes('/messages/thread/');
+    const hasThread = response.body.includes('/messages/read/') ||
+      response.body.includes('/messages/thread/') ||
+      response.body.includes('message_sent');
     if (hasThread) {
-      log.info('Message confirmed sent via mbasic (thread link found in response)');
+      log.info('Message confirmed sent (thread/success indicator found in response)');
+    } else if (this.httpClient.isLoginPage(response.body)) {
+      throw new MessageSendError('Session expired during send (redirected to login)');
     } else if (response.body.includes('error') && response.body.length < 2000) {
-      log.warn({ bodySnippet: response.body.substring(0, 500) }, 'mbasic response may contain error');
-      // Don't throw — Facebook sometimes returns pages without thread links but message was still sent
+      log.warn({ bodySnippet: response.body.substring(0, 500) }, 'Response may contain error');
     }
 
-    log.info('Message sent via mbasic.facebook.com');
+    log.info('Message sent via mobile/mbasic form submit');
   }
 
   private async sendViaGraphQL(
@@ -620,24 +724,83 @@ export class AutoMessage {
   ): Promise<void> {
     log.info({ recipientId }, 'Sending message via GraphQL API');
 
-    // Try to extract a fresh doc_id from the Messenger page
-    let docId = '7316395148464937'; // fallback
+    // Extract doc_id dynamically from the Messenger page JS bundles
+    const docIds = await this.extractSendMessageDocIds(recipientId);
+
+    if (docIds.length === 0) {
+      throw new MessageSendError('Could not find any send message doc_id from Messenger page');
+    }
+
+    // Try each doc_id until one works
+    let lastError = '';
+    for (const docId of docIds) {
+      try {
+        await this.trySendGraphQL(recipientId, myUserId, message, tokens, docId);
+        return;
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+        if (lastError.includes('was not found')) {
+          log.debug({ docId }, 'doc_id not found, trying next');
+          continue;
+        }
+        throw error; // Re-throw non-doc_id errors (auth failures etc.)
+      }
+    }
+
+    throw new MessageSendError(`GraphQL: all doc_ids failed. Last error: ${lastError}`);
+  }
+
+  private async extractSendMessageDocIds(recipientId: string): Promise<string[]> {
+    const docIds: string[] = [];
+
     try {
       const messengerPage = await this.httpClient.request(
         `https://www.facebook.com/messages/t/${recipientId}`,
         { referer: 'https://www.facebook.com/messages/' },
       );
-      // Look for send message mutation doc_id in page bundle
-      const docIdMatch =
-        messengerPage.body.match(/useSendMessageMutation[^}]{0,500}?(?:doc_id|"id")\s*[:=]\s*"(\d{10,})"/) ||
-        messengerPage.body.match(/(?:doc_id|"id")\s*[:=]\s*"(\d{10,})"[^}]{0,500}?useSendMessageMutation/);
-      if (docIdMatch) {
-        docId = docIdMatch[1];
-        log.info({ docId }, 'Extracted fresh send message doc_id');
+
+      // Look for send-related mutation doc_ids in various formats
+      const patterns = [
+        // Near useSendMessageMutation
+        /useSendMessageMutation[^}]{0,1000}?"(?:id|doc_id)"\s*:\s*"(\d{10,})"/g,
+        /"(?:id|doc_id)"\s*:\s*"(\d{10,})"[^}]{0,1000}?useSendMessageMutation/g,
+        // Near LSPlatformGraphQLLightspeedRequestForIGDQuery or similar send names
+        /[Ss]end[Mm]essage[^}]{0,500}?"(?:id|doc_id)"\s*:\s*"(\d{10,})"/g,
+        // Generic: e.preloader...queries with "send" nearby
+        /"preloader"[^}]{0,200}?"(?:id|doc_id)"\s*:\s*"(\d{10,})"/g,
+      ];
+
+      const seen = new Set<string>();
+      for (const pattern of patterns) {
+        let m;
+        while ((m = pattern.exec(messengerPage.body)) !== null) {
+          if (!seen.has(m[1])) {
+            seen.add(m[1]);
+            docIds.push(m[1]);
+          }
+        }
+      }
+
+      if (docIds.length > 0) {
+        log.info({ docIds }, 'Extracted send message doc_ids from Messenger page');
+      } else {
+        log.warn('No send message doc_ids found in Messenger page');
       }
     } catch (error) {
-      log.debug({ error }, 'Could not extract fresh doc_id, using fallback');
+      log.debug({ error }, 'Could not load Messenger page for doc_id extraction');
     }
+
+    return docIds;
+  }
+
+  private async trySendGraphQL(
+    recipientId: string,
+    myUserId: string,
+    message: string,
+    tokens: { fbDtsg: string; jazoest: string; lsd: string },
+    docId: string,
+  ): Promise<void> {
+    log.debug({ recipientId, docId }, 'Trying GraphQL send with doc_id');
 
     const variables = JSON.stringify({
       input: {
@@ -658,6 +821,7 @@ export class AutoMessage {
       doc_id: docId,
       __user: myUserId,
       __a: '1',
+      __comet_req: '15',
     });
 
     const response = await this.httpClient.post(
@@ -673,12 +837,11 @@ export class AutoMessage {
       throw new MessageSendError(`GraphQL returned HTTP ${response.statusCode}`);
     }
 
-    // Check for errors in response
-    try {
-      // GraphQL responses can be multi-line JSON objects
-      for (const line of body.split('\n')) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('{')) continue;
+    // Check for errors in response — Facebook returns multi-line JSON
+    for (const line of body.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('{')) continue;
+      try {
         const data = JSON.parse(trimmed);
         if (data.error === 1357001 || data.errorSummary) {
           throw new MessageSendError('GraphQL: session not authenticated');
@@ -687,69 +850,16 @@ export class AutoMessage {
           const errMsg = data.errors[0]?.message || JSON.stringify(data.errors);
           throw new MessageSendError(`GraphQL error: ${errMsg}`);
         }
+      } catch (e) {
+        if (e instanceof MessageSendError) throw e;
       }
-    } catch (e) {
-      if (e instanceof MessageSendError) throw e;
-      // If we got 200 and body isn't valid JSON or no errors found, assume success
     }
 
-    log.info({ recipientId }, 'Message sent via GraphQL');
-  }
-
-  private async sendViaLegacyEndpoint(
-    recipientId: string,
-    myUserId: string,
-    message: string,
-    tokens: { fbDtsg: string; jazoest: string; lsd: string },
-  ): Promise<void> {
-    const timestamp = Date.now();
-    const otherUserId = `fbid:${recipientId}`;
-    const selfId = `fbid:${myUserId}`;
-
-    const params = new URLSearchParams();
-    params.append('fb_dtsg', tokens.fbDtsg);
-    params.append('jazoest', tokens.jazoest);
-    params.append('message_batch[0][action_type]', 'ma-type:user-generated-message');
-    params.append('message_batch[0][author]', selfId);
-    params.append('message_batch[0][body]', message);
-    params.append('message_batch[0][ephemeral_ttl_mode]', '0');
-    params.append('message_batch[0][has_attachment]', 'false');
-    params.append('message_batch[0][is_spoof_warning]', 'false');
-    params.append('message_batch[0][source]', 'source:web');
-    params.append('message_batch[0][specific_to_list][0]', otherUserId);
-    params.append('message_batch[0][specific_to_list][1]', selfId);
-    params.append('message_batch[0][timestamp]', String(timestamp));
-    params.append('__user', myUserId);
-    params.append('__a', '1');
-
-    log.debug({ recipientId, myUserId }, 'Sending via /messaging/send/');
-
-    const response = await this.httpClient.post(
-      'https://www.facebook.com/messaging/send/',
-      params.toString(),
-      { referer: 'https://www.facebook.com/messages/t/' + recipientId },
-    );
-
-    if (response.statusCode !== 200) {
-      log.debug({ statusCode: response.statusCode, bodySnippet: response.body.substring(0, 500) }, 'messaging/send response');
-      throw new MessageSendError(`HTTP ${response.statusCode} from messaging endpoint`);
+    // Check if response contains "was not found" (wrong doc_id)
+    if (body.includes('was not found')) {
+      throw new MessageSendError(`GraphQL document with ID ${docId} was not found`);
     }
 
-    // Facebook AJAX responses have "for (;;);" prefix
-    const body = response.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
-
-    try {
-      const data = JSON.parse(body);
-      if (data.error) {
-        throw new MessageSendError(
-          `Facebook error: ${data.error.message || JSON.stringify(data.error)}`,
-        );
-      }
-    } catch (e) {
-      if (e instanceof MessageSendError) throw e;
-      // If we can't parse the response but got 200, assume success
-    }
-
-    log.info({ recipientId }, 'Message sent via /messaging/send/');
+    log.info({ recipientId, docId }, 'Message sent via GraphQL');
   }
 }
