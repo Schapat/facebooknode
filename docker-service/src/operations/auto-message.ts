@@ -303,6 +303,100 @@ export class AutoMessage {
     message: string,
     tokens: { fbDtsg: string; jazoest: string; lsd: string },
   ): Promise<void> {
+    const errors: string[] = [];
+
+    // Strategy 1: mbasic.facebook.com HTML form (most reliable)
+    try {
+      await this.sendViaMbasic(recipientId, message);
+      return;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      log.warn({ error: msg }, 'mbasic send failed, trying next strategy');
+      errors.push(`mbasic: ${msg}`);
+    }
+
+    // Strategy 2: Legacy /messaging/send/ endpoint
+    try {
+      await this.sendViaLegacyEndpoint(recipientId, myUserId, message, tokens);
+      return;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      log.warn({ error: msg }, 'Legacy send failed');
+      errors.push(`legacy: ${msg}`);
+    }
+
+    throw new MessageSendError(`All message send strategies failed: ${errors.join('; ')}`);
+  }
+
+  private async sendViaMbasic(recipientId: string, message: string): Promise<void> {
+    const composeUrl = `https://mbasic.facebook.com/messages/compose/?ids=${recipientId}`;
+    log.info({ recipientId }, 'Trying mbasic.facebook.com message send');
+
+    const page = await this.httpClient.request(composeUrl, {
+      referer: 'https://mbasic.facebook.com/',
+    });
+
+    if (this.httpClient.isLoginPage(page.body)) {
+      throw new MessageSendError('Session not valid on mbasic (login page)');
+    }
+
+    // Find the message send form
+    const formMatch =
+      page.body.match(/<form[^>]*action="(\/messages\/[^"]*)"[^>]*method="post"/i) ||
+      page.body.match(/<form[^>]*method="post"[^>]*action="(\/messages\/[^"]*)"/i);
+
+    if (!formMatch) {
+      log.debug({ bodySnippet: page.body.substring(0, 1000) }, 'mbasic page preview');
+      throw new MessageSendError('No message form found on mbasic compose page');
+    }
+
+    let formAction = formMatch[1].replace(/&amp;/g, '&');
+    if (!formAction.startsWith('http')) {
+      formAction = `https://mbasic.facebook.com${formAction}`;
+    }
+
+    // Extract hidden input fields
+    const params = new URLSearchParams();
+    const hiddenRegex = /<input[^>]*type="hidden"[^>]*/gi;
+    let match;
+    while ((match = hiddenRegex.exec(page.body)) !== null) {
+      const tag = match[0];
+      const nameMatch = tag.match(/name="([^"]*)"/);
+      const valueMatch = tag.match(/value="([^"]*)"/);
+      if (nameMatch) {
+        params.append(
+          nameMatch[1].replace(/&amp;/g, '&'),
+          valueMatch ? valueMatch[1].replace(/&amp;/g, '&') : '',
+        );
+      }
+    }
+
+    // Add message body
+    params.append('body', message);
+
+    // Extract submit button value (German: "Senden", English: "Send")
+    const submitMatch = page.body.match(/<input[^>]*name="send"[^>]*value="([^"]*)"/i);
+    params.append('send', submitMatch ? submitMatch[1] : 'Senden');
+
+    log.debug({ formAction }, 'Submitting mbasic message form');
+
+    const response = await this.httpClient.post(formAction, params.toString(), {
+      referer: composeUrl,
+    });
+
+    if (response.statusCode >= 400) {
+      throw new MessageSendError(`mbasic send returned HTTP ${response.statusCode}`);
+    }
+
+    log.info({ recipientId }, 'Message sent via mbasic.facebook.com');
+  }
+
+  private async sendViaLegacyEndpoint(
+    recipientId: string,
+    myUserId: string,
+    message: string,
+    tokens: { fbDtsg: string; jazoest: string; lsd: string },
+  ): Promise<void> {
     const timestamp = Date.now();
     const otherUserId = `fbid:${recipientId}`;
     const selfId = `fbid:${myUserId}`;

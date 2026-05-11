@@ -34,6 +34,9 @@ const DEFAULT_HEADERS: Record<string, string> = {
   'Cache-Control': 'max-age=0',
 };
 
+const MOBILE_USER_AGENT =
+  'Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36';
+
 const MAX_REDIRECTS = 5;
 
 export class FacebookHttpClient {
@@ -302,9 +305,11 @@ export class FacebookHttpClient {
       const isHttps = urlObj.protocol === 'https:';
       const postBody = options.body ? Buffer.from(options.body, 'utf-8') : null;
 
+      // Use mobile UA for mbasic.facebook.com (required to avoid "unsupported browser" block)
+      const isMbasic = urlObj.hostname.includes('mbasic.facebook.com');
       const headers: Record<string, string> = {
         ...DEFAULT_HEADERS,
-        'User-Agent': this.userAgent,
+        'User-Agent': isMbasic ? MOBILE_USER_AGENT : this.userAgent,
         Cookie: this.buildCookieString(),
         Referer: options.referer || 'https://www.facebook.com/',
       };
