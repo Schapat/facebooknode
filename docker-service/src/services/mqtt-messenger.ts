@@ -163,23 +163,42 @@ export class MQTTMessenger {
       const page = await this.httpClient.request('https://www.facebook.com/', {
         referer: 'https://www.facebook.com/',
       });
-      // Look for access token in the page
-      const atMatch = page.body.match(/"accessToken"\s*:\s*"([^"]+)"/);
-      if (atMatch) accessToken = atMatch[1];
-      if (!accessToken) {
-        const atMatch2 = page.body.match(/"access_token"\s*:\s*"([^"]+)"/);
-        if (atMatch2) accessToken = atMatch2[1];
+      // Various patterns Facebook embeds the token in
+      const patterns = [
+        /"accessToken"\s*:\s*"([^"]+)"/,
+        /"access_token"\s*:\s*"([^"]+)"/,
+        /EAAG[A-Za-z0-9]{30,}/,
+        /EAA[A-Za-z][A-Za-z0-9]{30,}/,
+        /"token"\s*:\s*"(EAA[^"]+)"/,
+        /DTSGInitialData.*?"token":"([^"]+)"/,
+      ];
+      for (const p of patterns) {
+        const m = page.body.match(p);
+        if (m) {
+          accessToken = m[1] || m[0];
+          result.tokenPattern = p.source.substring(0, 30);
+          break;
+        }
       }
+      // Also try to find the Messenger-specific page
       if (!accessToken) {
-        // Try EAAG token pattern
-        const atMatch3 = page.body.match(/(EAAG[A-Za-z0-9]+)/);
-        if (atMatch3) accessToken = atMatch3[1];
+        const msgPage = await this.httpClient.request('https://www.facebook.com/messages/', {
+          referer: 'https://www.facebook.com/',
+        });
+        for (const p of patterns) {
+          const m = msgPage.body.match(p);
+          if (m) {
+            accessToken = m[1] || m[0];
+            result.tokenPattern = 'messenger:' + p.source.substring(0, 30);
+            break;
+          }
+        }
       }
     } catch (err: any) {
       result.tokenError = err.message;
     }
     result.hasAccessToken = !!accessToken;
-    result.accessTokenPrefix = accessToken ? accessToken.substring(0, 10) + '...' : null;
+    result.accessTokenPrefix = accessToken ? accessToken.substring(0, 15) + '...' : null;
 
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
@@ -494,8 +513,11 @@ export class MQTTMessenger {
     // Protocol level: 3
     const protocolLevel = Buffer.from([3]);
 
-    // Connect flags: username(0x80) + password(0x40) + clean_session(0x02) = 0xC2
-    const connectFlags = Buffer.from([0xc2]);
+    // Connect flags:
+    // If we have an access token: username(0x80) + password(0x40) + clean_session(0x02) = 0xC2
+    // Otherwise: username(0x80) + clean_session(0x02) = 0x82
+    const hasPassword = !!accessToken;
+    const connectFlags = Buffer.from([hasPassword ? 0xc2 : 0x82]);
 
     // Keep alive: 60 seconds
     const keepAlive = Buffer.alloc(2);
@@ -514,13 +536,17 @@ export class MQTTMessenger {
     const usernameLen = Buffer.alloc(2);
     usernameLen.writeUInt16BE(compressed.length, 0);
 
-    // Password (access token)
-    const passwordBuf = Buffer.from(accessToken || '', 'utf-8');
-    const password = Buffer.alloc(2);
-    password.writeUInt16BE(passwordBuf.length, 0);
+    // Password (access token, if available)
+    const parts = [clientId, usernameLen, compressed];
+    if (hasPassword) {
+      const passwordBuf = Buffer.from(accessToken, 'utf-8');
+      const passwordLen = Buffer.alloc(2);
+      passwordLen.writeUInt16BE(passwordBuf.length, 0);
+      parts.push(passwordLen, passwordBuf);
+    }
 
     // Payload
-    const payload = Buffer.concat([clientId, usernameLen, compressed, password, passwordBuf]);
+    const payload = Buffer.concat(parts);
 
     // Remaining length
     const remainingLength = variableHeader.length + payload.length;
