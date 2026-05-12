@@ -154,8 +154,32 @@ export class MQTTMessenger {
     result.userId = this.userId;
 
     // Get cookies for WebSocket auth
-    const cookies = (this.httpClient as any).buildCookieString();
+    const cookies = this.httpClient.buildCookieString();
     result.hasCookies = !!cookies;
+
+    // Extract access_token from Facebook page (needed for MQTT auth)
+    let accessToken = '';
+    try {
+      const page = await this.httpClient.request('https://www.facebook.com/', {
+        referer: 'https://www.facebook.com/',
+      });
+      // Look for access token in the page
+      const atMatch = page.body.match(/"accessToken"\s*:\s*"([^"]+)"/);
+      if (atMatch) accessToken = atMatch[1];
+      if (!accessToken) {
+        const atMatch2 = page.body.match(/"access_token"\s*:\s*"([^"]+)"/);
+        if (atMatch2) accessToken = atMatch2[1];
+      }
+      if (!accessToken) {
+        // Try EAAG token pattern
+        const atMatch3 = page.body.match(/(EAAG[A-Za-z0-9]+)/);
+        if (atMatch3) accessToken = atMatch3[1];
+      }
+    } catch (err: any) {
+      result.tokenError = err.message;
+    }
+    result.hasAccessToken = !!accessToken;
+    result.accessTokenPrefix = accessToken ? accessToken.substring(0, 10) + '...' : null;
 
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
@@ -189,7 +213,7 @@ export class MQTTMessenger {
           log.info('WebSocket connected to edge-chat.facebook.com');
 
           // Send MQTT CONNECT packet
-          const connectPacket = this.buildConnectPacket();
+          const connectPacket = this.buildConnectPacket(accessToken);
           result.connectPacketSize = connectPacket.length;
           this.ws!.send(connectPacket);
           log.info({ size: connectPacket.length }, 'Sent CONNECT packet');
@@ -437,7 +461,7 @@ export class MQTTMessenger {
   /**
    * Build MQTToT CONNECT packet - try JSON format (web client uses this)
    */
-  private buildConnectPacket(): Buffer {
+  private buildConnectPacket(accessToken: string): Buffer {
     // The web client sends JSON username, not Thrift
     const usernameJson = JSON.stringify({
       u: this.userId,
@@ -490,12 +514,13 @@ export class MQTTMessenger {
     const usernameLen = Buffer.alloc(2);
     usernameLen.writeUInt16BE(compressed.length, 0);
 
-    // Password (empty)
+    // Password (access token)
+    const passwordBuf = Buffer.from(accessToken || '', 'utf-8');
     const password = Buffer.alloc(2);
-    password.writeUInt16BE(0, 0);
+    password.writeUInt16BE(passwordBuf.length, 0);
 
     // Payload
-    const payload = Buffer.concat([clientId, usernameLen, compressed, password]);
+    const payload = Buffer.concat([clientId, usernameLen, compressed, password, passwordBuf]);
 
     // Remaining length
     const remainingLength = variableHeader.length + payload.length;
