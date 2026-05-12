@@ -212,6 +212,35 @@ export function registerScrapeRoutes(
               return results.length > 0 ? results : null;
             })(),
             hasEndCursor: !!(response.body.match(/"end_cursor"\s*:\s*"([^"]{10,})"/)),
+            // Context around the group slug in the response
+            slugContext: (() => {
+              const slug = body.groupUrl.match(/groups\/([^/?]+)/)?.[1];
+              if (!slug) return null;
+              const contexts: string[] = [];
+              let idx = 0;
+              while (contexts.length < 5) {
+                idx = response.body.indexOf(slug, idx);
+                if (idx === -1) break;
+                const start = Math.max(0, idx - 100);
+                const end = Math.min(response.body.length, idx + slug.length + 150);
+                contexts.push(response.body.substring(start, end).replace(/[\n\r]/g, ' '));
+                idx += slug.length;
+              }
+              return { slug, occurrences: contexts.length, contexts };
+            })(),
+            // Any numeric IDs > 10 digits near "Group" type
+            numericIds: (() => {
+              const ids = new Set<string>();
+              for (const m of response.body.matchAll(/"(\d{10,20})"/g)) {
+                if (ids.size >= 10) break;
+                // Check context around the match
+                const ctx = response.body.substring(Math.max(0, m.index! - 50), Math.min(response.body.length, m.index! + 50));
+                if (ctx.includes('Group') || ctx.includes('group')) {
+                  ids.add(m[1]);
+                }
+              }
+              return Array.from(ids);
+            })(),
           },
           timestamp: new Date().toISOString(),
         });
