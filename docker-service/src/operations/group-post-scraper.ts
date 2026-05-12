@@ -36,6 +36,8 @@ export class GroupPostScraper {
           if (isSessionIssue) {
             sessionExpired = true;
             log.error({ groupUrl, error: msg, scrapedSoFar: allPosts.length }, 'Session expired or blocked - stopping scrape. Cookies need renewal.');
+            // Mark session invalid so next run will re-import cookies
+            await this.sessionManager.markInvalid(sessionName);
             // Stop scraping remaining groups — all will fail with bad session
             break;
           }

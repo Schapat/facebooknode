@@ -16,21 +16,6 @@ async function ensureSession(
   proxy: string,
   userAgent: string,
 ): Promise<void> {
-  try {
-    const statusResponse = await ctx.helpers.request({
-      method: 'GET',
-      url: `${apiUrl}/api/session/status?sessionName=${encodeURIComponent(sessionName)}`,
-      headers: { Authorization: `Bearer ${apiKey}` },
-      json: true,
-    });
-
-    if (statusResponse.success && statusResponse.data?.isValid) {
-      return;
-    }
-  } catch {
-    // Session doesn't exist, create it
-  }
-
   if (!cookiesJson) {
     throw new NodeOperationError(
       ctx.getNode(),
@@ -48,6 +33,9 @@ async function ensureSession(
     );
   }
 
+  // Always re-import cookies so credential updates are picked up immediately.
+  // Previously we skipped import when the session was "valid", which meant
+  // updated cookies in the n8n credentials were never sent to the service.
   const importBody: Record<string, unknown> = {
     sessionName,
     cookies,

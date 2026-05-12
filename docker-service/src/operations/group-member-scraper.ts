@@ -25,6 +25,13 @@ export class GroupMemberScraper {
           const members = await this.scrapeMembers(groupUrl, input);
           allMembers.push(...members);
         } catch (error) {
+          const msg = error instanceof Error ? error.message : 'Unknown error';
+          const isSessionIssue = msg.includes('login page') || msg.includes('checkpoint') || msg.includes('Session expired');
+          if (isSessionIssue) {
+            log.error({ groupUrl, error: msg }, 'Session expired or blocked - stopping scrape. Cookies need renewal.');
+            await this.sessionManager.markInvalid(sessionName);
+            throw new ScrapeError('Session expired or blocked by Facebook. Please update your cookies.');
+          }
           log.error({ groupUrl, error }, 'Failed to scrape members');
         }
         if (input.groups.indexOf(groupUrl) < input.groups.length - 1) {
