@@ -5,6 +5,7 @@ import { AutoMessage } from '../operations/auto-message';
 import { SessionManager } from '../services/session-manager';
 import { FacebookHttpClient } from '../services/facebook-http-client';
 import { E2EESignalClient } from '../services/e2ee-signal';
+import { MQTTMessenger } from '../services/mqtt-messenger';
 import { createChildLogger } from '../utils/logger';
 
 const log = createChildLogger({ service: 'MessageRoutes' });
@@ -175,6 +176,58 @@ export function registerMessageRoutes(
         });
       } catch (error) {
         log.error({ error }, 'E2EE diagnosis failed');
+        return reply.status(500).send({
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error',
+          timestamp: new Date().toISOString(),
+        });
+      }
+    },
+  });
+
+  // ── MQTT Test ──────────────────────────────────────────────────
+  app.post('/message/mqtt-test', {
+    schema: {
+      description: 'Test MQTT WebSocket connection to Facebook',
+      tags: ['Message'],
+      body: {
+        type: 'object',
+        required: ['sessionName'],
+        properties: {
+          sessionName: { type: 'string' },
+          recipientId: { type: 'string' },
+          message: { type: 'string' },
+        },
+      },
+    },
+    handler: async (request, reply) => {
+      const body = (request.body as { sessionName: string; recipientId?: string; message?: string });
+
+      try {
+        const httpClient = new FacebookHttpClient(sessionManager);
+        await httpClient.initSession(body.sessionName);
+
+        const mqtt = new MQTTMessenger(httpClient);
+        const connectResult = await mqtt.connect();
+
+        let sendResult: Record<string, unknown> | null = null;
+        if (connectResult.connackSuccess && body.recipientId && body.message) {
+          sendResult = await mqtt.testSend(body.recipientId, body.message);
+        }
+
+        mqtt.disconnect();
+        await httpClient.persistCookies();
+
+        return reply.status(200).send({
+          success: true,
+          data: {
+            connection: connectResult,
+            send: sendResult,
+          },
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        log.error({ error }, 'MQTT test failed');
         return reply.status(500).send({
           success: false,
           error: error instanceof Error ? error.message : 'Unknown error',

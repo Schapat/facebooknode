@@ -141,7 +141,7 @@ export class FacebookHttpClient {
     }
   }
 
-  private buildCookieString(): string {
+  buildCookieString(): string {
     const now = Date.now() / 1000;
     return Array.from(this.cookies.values())
       .filter((c) => {
