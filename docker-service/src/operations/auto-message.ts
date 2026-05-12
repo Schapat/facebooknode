@@ -140,17 +140,60 @@ export class AutoMessage {
       // The Lightspeed doc_id for sending messages (discovered via SPA extraction)
       const LS_DOC_ID = '9697184873702141';
 
-      // Try multiple payload formats for the LSPlatform send
+      // First: extract the real version_id from the Messenger SPA
+      let versionId = '0';
+      try {
+        const messengerPage = await this.httpClient.request('https://www.facebook.com/messages/', {
+          referer: 'https://www.facebook.com/',
+        });
+        // Search for version_id or schemaVersion in the SPA JavaScript
+        const versionPatterns = [
+          /version_id['"]\s*:\s*['"]([\d]+)['"]/,
+          /schemaVersion['"]\s*:\s*['"]([\d]+)['"]/,
+          /"lsVersion"\s*:\s*"(\d+)"/,
+          /LS_VERSION['"]\s*[=:]\s*['"]([\d]+)['"]/,
+          /ls_version['"]\s*:\s*['"]([\d]+)['"]/,
+          /syncParams[^}]*version['"]\s*:\s*['"]([\d]+)['"]/,
+          /"version"\s*:\s*(\d{10,})/,
+        ];
+        for (const pat of versionPatterns) {
+          const m = messengerPage.body.match(pat);
+          if (m) {
+            versionId = m[1];
+            results.versionIdSource = pat.source.substring(0, 40);
+            break;
+          }
+        }
+        // Also search for all large numbers near "version" 
+        const versionContext: string[] = [];
+        const vContextPattern = /version[^"]*"(\d{10,20})"/gi;
+        let vc;
+        while ((vc = vContextPattern.exec(messengerPage.body)) !== null) {
+          if (!versionContext.includes(vc[1])) versionContext.push(vc[1]);
+          if (versionContext.length >= 10) break;
+        }
+        results.versionCandidates = versionContext;
+        results.messengerPageLength = messengerPage.body.length;
+      } catch (error) {
+        results.versionExtractError = error instanceof Error ? error.message : String(error);
+      }
+      results.versionId = versionId;
+
+      // Try sending with discovered version_id
       const timestamp = Date.now();
       const otid = `${timestamp}${Math.floor(Math.random() * 1000000000)}`;
 
-      const payloadFormats: Record<string, string> = {
-        // Format 1: LSPlatform task-based (label 46 = send message)
-        'ls-tasks': JSON.stringify({
+      const gqlBody = new URLSearchParams({
+        fb_dtsg: fbDtsg,
+        jazoest,
+        lsd,
+        fb_api_caller_class: 'RelayModern',
+        fb_api_req_friendly_name: 'LSPlatformGraphQLLightspeedRequestQuery',
+        variables: JSON.stringify({
           deviceId: `device_${myUserId}_${timestamp}`,
           requestId: 0,
           requestPayload: JSON.stringify({
-            version_id: '9477666248971112',
+            version_id: versionId,
             tasks: [{
               label: '46',
               payload: JSON.stringify({
@@ -158,7 +201,7 @@ export class AutoMessage {
                 otid,
                 source: 0,
                 send_type: 1,
-                text: 'Test von der Automatisierung',
+                text: 'Test Nachricht von der Automatisierung',
               }),
               queue_name: recipientId,
               task_id: 1,
@@ -168,69 +211,28 @@ export class AutoMessage {
           }),
           requestType: 3,
         }),
-        // Format 2: Simpler variables
-        'simple-input': JSON.stringify({
-          input: {
-            message: { text: 'Test von der Automatisierung' },
-            actor_id: myUserId,
-            thread_id: recipientId,
-            client_mutation_id: otid,
-          },
-        }),
-        // Format 3: deviceId + requestPayload with different task format
-        'ls-tasks-v2': JSON.stringify({
-          deviceId: `device_${myUserId}_${timestamp}`,
-          requestId: 1,
-          requestPayload: JSON.stringify({
-            version_id: '9477666248971112',
-            tasks: [{
-              label: '46',
-              payload: JSON.stringify({
-                thread_id: Number(recipientId),
-                otid,
-                source: 0,
-                send_type: 1,
-                text: 'Test von der Automatisierung',
-                initiating_source: 1,
-              }),
-              queue_name: `${recipientId}`,
-              task_id: 1,
-              failure_count: null,
-            }],
-            epoch_id: timestamp,
-            data_trace_id: null,
-          }),
-          requestType: 3,
-        }),
-      };
+        doc_id: LS_DOC_ID,
+        __a: '1',
+      }).toString();
 
-      for (const [formatName, variables] of Object.entries(payloadFormats)) {
-        try {
-          const gqlBody = new URLSearchParams({
-            fb_dtsg: fbDtsg,
-            jazoest,
-            lsd,
-            fb_api_caller_class: 'RelayModern',
-            fb_api_req_friendly_name: 'LSPlatformGraphQLLightspeedRequestQuery',
-            variables,
-            doc_id: LS_DOC_ID,
-            __a: '1',
-          }).toString();
-
-          const gqlResp = await this.httpClient.post(
-            'https://www.facebook.com/api/graphql/',
-            gqlBody,
-            { referer: 'https://www.facebook.com/messages/' },
-          );
-          const cleanBody = gqlResp.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
-          results[`send-${formatName}`] = {
-            statusCode: gqlResp.statusCode,
-            bodyLength: gqlResp.body.length,
-            snippet: cleanBody.substring(0, 800),
-          };
-        } catch (error) {
-          results[`send-${formatName}`] = { error: error instanceof Error ? error.message : String(error) };
-        }
+      try {
+        const gqlResp = await this.httpClient.post(
+          'https://www.facebook.com/api/graphql/',
+          gqlBody,
+          { referer: 'https://www.facebook.com/messages/' },
+        );
+        const cleanBody = gqlResp.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
+        const hasFailed = cleanBody.includes('markOptimisticMessageFailed');
+        const hasSuccess = cleanBody.includes('replaceOptimisticMessage') || cleanBody.includes('insertMessage');
+        results['send-result'] = {
+          statusCode: gqlResp.statusCode,
+          bodyLength: gqlResp.body.length,
+          hasFailed,
+          hasSuccess,
+          snippet: cleanBody.substring(0, 1000),
+        };
+      } catch (error) {
+        results['send-result'] = { error: error instanceof Error ? error.message : String(error) };
       }
     }
 
