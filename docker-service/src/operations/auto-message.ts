@@ -137,90 +137,83 @@ export class AutoMessage {
     }
 
     if (fbDtsg) {
-      // 4a. Search the Facebook SPA for messaging-related doc_ids
-      try {
-        const messengerPage = await this.httpClient.request('https://www.facebook.com/messages/', {
-          referer: 'https://www.facebook.com/',
-        });
-        // Search for doc_id patterns near messaging keywords
-        const docIdMatches: string[] = [];
-        // Pattern: e.id="DOCID" or doc_id:"DOCID" or preloadable_id:"DOCID"
-        const patterns = [
-          /(?:e\.id|doc_id|preloadable_id)\s*[=:]\s*"(\d{10,20})"/g,
-          /"queryID"\s*:\s*"(\d{10,20})"/g,
-          /__d\("(\d{10,20})"\)/g,
-        ];
-        for (const pattern of patterns) {
-          let m;
-          while ((m = pattern.exec(messengerPage.body)) !== null) {
-            if (!docIdMatches.includes(m[1])) docIdMatches.push(m[1]);
-          }
-        }
-        // Also search for doc_ids near "send" or "message" strings
-        const sendDocIds: string[] = [];
-        const sendPattern = /[Ss]end[Mm]essage[^"]*"[^"]*"(\d{10,20})"|"(\d{10,20})"[^"]*[Ss]end[Mm]essage/g;
-        let sm;
-        while ((sm = sendPattern.exec(messengerPage.body)) !== null) {
-          const id = sm[1] || sm[2];
-          if (id && !sendDocIds.includes(id)) sendDocIds.push(id);
-        }
-        // Search for LSPlatform related doc_ids
-        const lsPattern = /LSPlatform[^"]*"[^"]*"(\d{10,20})"|"(\d{10,20})"[^"]*LSPlatform/g;
-        while ((sm = lsPattern.exec(messengerPage.body)) !== null) {
-          const id = sm[1] || sm[2];
-          if (id && !sendDocIds.includes(id)) sendDocIds.push(id);
-        }
+      // The Lightspeed doc_id for sending messages (discovered via SPA extraction)
+      const LS_DOC_ID = '9697184873702141';
 
-        results['docIdSearch'] = {
-          messengerPageLength: messengerPage.body.length,
-          totalDocIdsFound: docIdMatches.length,
-          firstFewDocIds: docIdMatches.slice(0, 20),
-          sendRelatedDocIds: sendDocIds,
-        };
-      } catch (error) {
-        results['docIdSearch'] = { error: error instanceof Error ? error.message : String(error) };
-      }
+      // Try multiple payload formats for the LSPlatform send
+      const timestamp = Date.now();
+      const otid = `${timestamp}${Math.floor(Math.random() * 1000000000)}`;
 
-      // 4b. Try ALL extracted doc_ids from the Messenger SPA
-      // Remove the hardcoded known IDs — they're all outdated
-      // Instead, probe each extracted doc_id to find valid ones
-      const docIdsToTry = results['docIdSearch'] 
-        ? (results['docIdSearch'] as Record<string, unknown>).firstFewDocIds as string[] || []
-        : [];
+      const payloadFormats: Record<string, string> = {
+        // Format 1: LSPlatform task-based (label 46 = send message)
+        'ls-tasks': JSON.stringify({
+          deviceId: `device_${myUserId}_${timestamp}`,
+          requestId: 0,
+          requestPayload: JSON.stringify({
+            version_id: '9477666248971112',
+            tasks: [{
+              label: '46',
+              payload: JSON.stringify({
+                thread_id: recipientId,
+                otid,
+                source: 0,
+                send_type: 1,
+                text: 'Test von der Automatisierung',
+              }),
+              queue_name: recipientId,
+              task_id: 1,
+              failure_count: null,
+            }],
+            epoch_id: timestamp,
+          }),
+          requestType: 3,
+        }),
+        // Format 2: Simpler variables
+        'simple-input': JSON.stringify({
+          input: {
+            message: { text: 'Test von der Automatisierung' },
+            actor_id: myUserId,
+            thread_id: recipientId,
+            client_mutation_id: otid,
+          },
+        }),
+        // Format 3: deviceId + requestPayload with different task format
+        'ls-tasks-v2': JSON.stringify({
+          deviceId: `device_${myUserId}_${timestamp}`,
+          requestId: 1,
+          requestPayload: JSON.stringify({
+            version_id: '9477666248971112',
+            tasks: [{
+              label: '46',
+              payload: JSON.stringify({
+                thread_id: Number(recipientId),
+                otid,
+                source: 0,
+                send_type: 1,
+                text: 'Test von der Automatisierung',
+                initiating_source: 1,
+              }),
+              queue_name: `${recipientId}`,
+              task_id: 1,
+              failure_count: null,
+            }],
+            epoch_id: timestamp,
+            data_trace_id: null,
+          }),
+          requestType: 3,
+        }),
+      };
 
-      const validDocIds: Array<{ docId: string; snippet: string }> = [];
-      for (const docId of docIdsToTry) {
+      for (const [formatName, variables] of Object.entries(payloadFormats)) {
         try {
-          // Use LSPlatform task format — this is how Messenger sends messages
           const gqlBody = new URLSearchParams({
             fb_dtsg: fbDtsg,
             jazoest,
             lsd,
             fb_api_caller_class: 'RelayModern',
             fb_api_req_friendly_name: 'LSPlatformGraphQLLightspeedRequestQuery',
-            variables: JSON.stringify({
-              deviceId: 'device_id_' + Date.now(),
-              requestId: 0,
-              requestPayload: JSON.stringify({
-                version_id: '0',
-                tasks: [{
-                  label: '46',
-                  payload: JSON.stringify({
-                    thread_id: recipientId,
-                    otid: String(Date.now()) + ':' + Math.floor(Math.random() * 1000000000),
-                    source: 0,
-                    send_type: 1,
-                    text: '',
-                  }),
-                  queue_name: recipientId,
-                  task_id: 1,
-                  failure_count: null,
-                }],
-                epoch_id: Date.now(),
-              }),
-              requestType: 3,
-            }),
-            doc_id: docId,
+            variables,
+            doc_id: LS_DOC_ID,
             __a: '1',
           }).toString();
 
@@ -230,14 +223,15 @@ export class AutoMessage {
             { referer: 'https://www.facebook.com/messages/' },
           );
           const cleanBody = gqlResp.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
-          const isNotFound = cleanBody.includes('was not found');
-          if (!isNotFound) {
-            validDocIds.push({ docId, snippet: cleanBody.substring(0, 300) });
-          }
-        } catch { /* skip */ }
+          results[`send-${formatName}`] = {
+            statusCode: gqlResp.statusCode,
+            bodyLength: gqlResp.body.length,
+            snippet: cleanBody.substring(0, 800),
+          };
+        } catch (error) {
+          results[`send-${formatName}`] = { error: error instanceof Error ? error.message : String(error) };
+        }
       }
-
-      results['validDocIds'] = validDocIds;
     }
 
     results.fbDtsgFound = !!fbDtsg;
