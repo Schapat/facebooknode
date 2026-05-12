@@ -165,7 +165,7 @@ export class MQTTMessenger {
       }, 10000);
 
       try {
-        this.ws = new WebSocket('wss://edge-chat.facebook.com/chat', ['chat'], {
+        this.ws = new WebSocket('wss://edge-chat.facebook.com/chat', {
           headers: {
             Origin: 'https://www.facebook.com',
             Cookie: cookies,
