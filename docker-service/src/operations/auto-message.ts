@@ -42,48 +42,186 @@ export class AutoMessage {
     results.myUserId = myUserId;
     results.cookieDebug = this.httpClient.getCookieDebugInfo();
 
-    // Test multiple User-Agents against the compose URL to find one that works
-    const testUrl = `https://mbasic.facebook.com/messages/compose/?ids=${recipientId}`;
-    const userAgents: Record<string, string> = {
-      'chrome53-android5': 'Mozilla/5.0 (Linux; Android 5.1.1; Nexus 5 Build/LMY48B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/53.0.2785.143 Mobile Safari/537.36',
-      'chrome83-android10': 'Mozilla/5.0 (Linux; Android 10; SM-A205U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.106 Mobile Safari/537.36',
-      'firefox41-android': 'Mozilla/5.0 (Android 4.4; Mobile; rv:41.0) Gecko/41.0 Firefox/41.0',
-      'operamini': 'Opera/9.80 (Android; Opera Mini/36.2.2254/119.132; U; en) Presto/2.12.423 Version/12.16',
-      'kaios': 'Mozilla/5.0 (Mobile; LYF/F90M/LYF-F90M-000-02-28-130718; Android; rv:48.0) Gecko/48.0 Firefox/48.0 KAIOS/2.0',
-      'ucbrowser': 'Mozilla/5.0 (Linux; U; Android 4.4.4; en-US; XT1022 Build/KXC21.5-40) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 UCBrowser/11.0.0.828 U3/0.8.0 Mobile Safari/534.30',
-      'android-stock': 'Mozilla/5.0 (Linux; U; Android 4.4.2; en-us; SCH-I535 Build/KOT49H) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
-    };
+    // 1. Test mbasic homepage — confirm session works, extract tokens
+    try {
+      const home = await this.httpClient.request('https://mbasic.facebook.com/', {
+        referer: 'https://mbasic.facebook.com/',
+      });
+      const dtsgMatch = home.body.match(/name="fb_dtsg"\s+value="([^"]+)"/);
+      const jazoestMatch = home.body.match(/name="jazoest"\s+value="(\d+)"/);
+      results['mbasic-home'] = {
+        statusCode: home.statusCode,
+        bodyLength: home.body.length,
+        isLoginPage: this.httpClient.isLoginPage(home.body),
+        hasFbDtsg: !!dtsgMatch,
+        fbDtsg: dtsgMatch ? dtsgMatch[1].substring(0, 20) + '...' : null,
+        jazoest: jazoestMatch ? jazoestMatch[1] : null,
+        hasUnsupported: home.body.includes('unsupported-interstitial'),
+      };
+    } catch (error) {
+      results['mbasic-home'] = { error: error instanceof Error ? error.message : String(error) };
+    }
 
-    for (const [name, ua] of Object.entries(userAgents)) {
-      try {
-        const page = await this.httpClient.requestWithUA(testUrl, ua, {
+    // 2. Test mbasic inbox — does the messaging section work at all?
+    try {
+      const inbox = await this.httpClient.request('https://mbasic.facebook.com/messages/', {
+        referer: 'https://mbasic.facebook.com/',
+      });
+      const textContent = inbox.body
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .substring(0, 500);
+      results['mbasic-inbox'] = {
+        statusCode: inbox.statusCode,
+        bodyLength: inbox.body.length,
+        isLoginPage: this.httpClient.isLoginPage(inbox.body),
+        hasUnsupported: inbox.body.includes('unsupported-interstitial'),
+        hasThreadLinks: inbox.body.includes('/messages/read/') || inbox.body.includes('/messages/thread/'),
+        textContent,
+      };
+    } catch (error) {
+      results['mbasic-inbox'] = { error: error instanceof Error ? error.message : String(error) };
+    }
+
+    // 3. Test m.facebook.com compose (different from mbasic)
+    try {
+      const mCompose = await this.httpClient.request(
+        `https://m.facebook.com/messages/compose/?ids=${recipientId}`,
+        { referer: 'https://m.facebook.com/messages/' },
+      );
+      const titleMatch = mCompose.body.match(/<title>([^<]*)<\/title>/i);
+      results['m-compose'] = {
+        statusCode: mCompose.statusCode,
+        bodyLength: mCompose.body.length,
+        isLoginPage: this.httpClient.isLoginPage(mCompose.body),
+        title: titleMatch ? titleMatch[1] : null,
+        hasBodyField: mCompose.body.includes('name="body"'),
+        hasTextarea: /<textarea/i.test(mCompose.body),
+        hasUnsupported: mCompose.body.includes('unsupported-interstitial'),
+        isReactSPA: mCompose.body.includes('__bbox') || mCompose.body.length > 500000,
+      };
+    } catch (error) {
+      results['m-compose'] = { error: error instanceof Error ? error.message : String(error) };
+    }
+
+    // 4. Try direct POST to known send endpoints (blind send, no form scraping)
+    // Get tokens first from mbasic homepage
+    let fbDtsg = '';
+    let jazoest = '';
+    try {
+      const tokenPage = await this.httpClient.request('https://mbasic.facebook.com/', {
+        referer: 'https://mbasic.facebook.com/',
+      });
+      const dtsgMatch = tokenPage.body.match(/name="fb_dtsg"\s+value="([^"]+)"/);
+      const jazoestMatch = tokenPage.body.match(/name="jazoest"\s+value="(\d+)"/);
+      fbDtsg = dtsgMatch ? dtsgMatch[1] : '';
+      jazoest = jazoestMatch ? jazoestMatch[1] : '';
+    } catch { /* ignore */ }
+
+    if (fbDtsg) {
+      // 4a. Try /messaging/send/ endpoint (legacy desktop)
+      const sendEndpoints = [
+        {
+          name: 'messaging-send',
+          url: 'https://www.facebook.com/messaging/send/',
+          referer: 'https://www.facebook.com/messages/',
+          body: new URLSearchParams({
+            fb_dtsg: fbDtsg,
+            jazoest,
+            body: '[DIAGNOSE TEST - NOT SENDING]',
+            'ids[0]': recipientId,
+            action_type: 'ma-type:user-generated-message',
+            has_attachment: 'false',
+            __a: '1',
+          }).toString(),
+        },
+        {
+          name: 'ajax-mercury',
+          url: 'https://www.facebook.com/ajax/mercury/send_messages.php',
+          referer: 'https://www.facebook.com/messages/',
+          body: new URLSearchParams({
+            fb_dtsg: fbDtsg,
+            jazoest,
+            'message_batch[0][action_type]': 'ma-type:user-generated-message',
+            'message_batch[0][body]': '[DIAGNOSE TEST - NOT SENDING]',
+            'message_batch[0][specific_to_list][0]': `fbid:${recipientId}`,
+            'message_batch[0][specific_to_list][1]': `fbid:${myUserId}`,
+            'message_batch[0][has_attachment]': 'false',
+            'message_batch[0][source]': 'source:web',
+            __a: '1',
+          }).toString(),
+        },
+        {
+          name: 'mbasic-send',
+          url: 'https://mbasic.facebook.com/messages/send/',
           referer: 'https://mbasic.facebook.com/messages/',
-        });
+          body: new URLSearchParams({
+            fb_dtsg: fbDtsg,
+            jazoest,
+            body: '[DIAGNOSE TEST - NOT SENDING]',
+            'ids[]': recipientId,
+            send: 'Senden',
+          }).toString(),
+        },
+      ];
 
-        const hasBodyField = page.body.includes('name="body"') || page.body.includes('name="message_body"');
-        const hasTextarea = /<textarea/i.test(page.body);
-        const hasUnsupported = page.body.includes('unsupported-interstitial');
-        const isLogin = this.httpClient.isLoginPage(page.body);
-        const foundFormAction = this.findPostForm(page.body);
-        const titleMatch = page.body.match(/<title>([^<]*)<\/title>/i);
+      for (const ep of sendEndpoints) {
+        try {
+          // Only do a GET probe (not POST) to check if endpoint exists
+          // We don't want to accidentally send a test message
+          const probe = await this.httpClient.request(ep.url, { referer: ep.referer });
+          results[ep.name] = {
+            statusCode: probe.statusCode,
+            bodyLength: probe.body.length,
+            isLoginPage: this.httpClient.isLoginPage(probe.body),
+            isRedirect: probe.body.includes('window.location') || probe.statusCode === 302,
+            hasUnsupported: probe.body.includes('unsupported-interstitial'),
+            snippet: probe.body.substring(0, 300),
+          };
+        } catch (error) {
+          results[ep.name] = { error: error instanceof Error ? error.message : String(error) };
+        }
+      }
 
-        results[name] = {
-          ua: ua.substring(0, 60) + '...',
-          statusCode: page.statusCode,
-          bodyLength: page.body.length,
-          isLoginPage: isLogin,
-          title: titleMatch ? titleMatch[1] : null,
-          hasBodyField,
-          hasTextarea,
-          hasUnsupported,
-          detectedFormAction: foundFormAction,
-          hasMessagingForm: !!(hasBodyField || hasTextarea || (foundFormAction && foundFormAction.includes('/messages/'))),
+      // 4b. Try GraphQL send mutation (LSPlatformGraphQLLightspeedRequestQuery)
+      try {
+        // Just probe if the graphql endpoint responds with something meaningful
+        const gqlBody = new URLSearchParams({
+          fb_dtsg: fbDtsg,
+          jazoest,
+          fb_api_caller_class: 'RelayModern',
+          fb_api_req_friendly_name: 'useSendMessageMutation',
+          variables: JSON.stringify({
+            input: {
+              otherUserFBID: recipientId,
+              message: { text: '' }, // empty — just probing
+              source: 'messenger:web',
+            },
+          }),
+          doc_id: '0', // placeholder — we need the real one
+          __a: '1',
+        }).toString();
+
+        const gqlResp = await this.httpClient.post(
+          'https://www.facebook.com/api/graphql/',
+          gqlBody,
+          { referer: 'https://www.facebook.com/messages/' },
+        );
+        const cleanBody = gqlResp.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
+        results['graphql-send'] = {
+          statusCode: gqlResp.statusCode,
+          bodyLength: gqlResp.body.length,
+          snippet: cleanBody.substring(0, 500),
         };
       } catch (error) {
-        results[name] = { ua: ua.substring(0, 60) + '...', error: error instanceof Error ? error.message : String(error) };
+        results['graphql-send'] = { error: error instanceof Error ? error.message : String(error) };
       }
     }
 
+    results.fbDtsgFound = !!fbDtsg;
     return results;
   }
 
