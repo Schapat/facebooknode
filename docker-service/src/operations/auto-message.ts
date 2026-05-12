@@ -325,7 +325,9 @@ export class AutoMessage {
         results.bundleSearchError = error instanceof Error ? error.message : String(error);
       }
 
-      // Step 2: Try a SYNC request (requestType=1)
+      // Step 2: Do a proper initial SYNC with the correct version, THEN send
+      // The server likely needs a sync handshake before accepting send tasks
+      const syncVersion = versionId !== '0' ? versionId : '26586128724376559';
       try {
         const syncBody = new URLSearchParams({
           fb_dtsg: fbDtsg,
@@ -334,17 +336,17 @@ export class AutoMessage {
           fb_api_caller_class: 'RelayModern',
           fb_api_req_friendly_name: 'LSPlatformGraphQLLightspeedRequestQuery',
           variables: JSON.stringify({
-            deviceId: `device_${myUserId}_${Date.now()}`,
+            deviceId: `device_${myUserId}_0`,
             requestId: 0,
             requestPayload: JSON.stringify({
-              version_id: '9477666248971112',
+              version_id: syncVersion,
               database: 1,
               epoch_id: 0,
               last_applied_cursor: null,
               sync_params: '',
               tasks: [],
             }),
-            requestType: 1,  // SYNC — not execute
+            requestType: 1,  // SYNC
           }),
           doc_id: LS_DOC_ID,
           __a: '1',
@@ -370,9 +372,10 @@ export class AutoMessage {
         results['sync-request'] = { error: error instanceof Error ? error.message : String(error) };
       }
 
-      // Step 3: Try sending with correct version + multiple payload variations
+      // Step 3: Try sending with correct version — same deviceId as sync
       const timestamp = Date.now();
       const vid = versionId !== '0' ? versionId : '26586128724376559';
+      const deviceId = `device_${myUserId}_0`;  // Same as sync
 
       // Test multiple payload formats to find what works
       const payloadVariations: Array<{name: string; payload: Record<string, unknown>}> = [
@@ -422,7 +425,7 @@ export class AutoMessage {
           fb_api_caller_class: 'RelayModern',
           fb_api_req_friendly_name: 'LSPlatformGraphQLLightspeedRequestQuery',
           variables: JSON.stringify({
-            deviceId: `device_${myUserId}_${timestamp}`,
+            deviceId,
             requestId: 0,
             requestPayload: JSON.stringify({
               version_id: vid,
