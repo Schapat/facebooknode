@@ -51,6 +51,7 @@ export interface GroupPostScraperInput {
   lastScrapeTimestamp?: string;
   maxPosts?: number;
   scrollTimeout?: number;
+  groupDelay?: number;
 }
 
 export interface GroupMemberScraperInput {

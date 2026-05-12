@@ -34,8 +34,11 @@ export class GroupPostScraper {
         }
         // Delay between groups to avoid rate-limiting
         if (i < input.groups.length - 1) {
-          const delay = input.groups.length > 5 ? randomDelay(5000, 10000) : randomDelay(3000, 6000);
-          await delay;
+          const baseDelay = input.groupDelay || 30000;
+          const jitter = Math.floor(Math.random() * 5000); // 0-5s random jitter
+          const delayMs = baseDelay + jitter;
+          log.info({ delayMs, nextGroup: input.groups[i + 1] }, 'Waiting before next group');
+          await new Promise(resolve => setTimeout(resolve, delayMs));
         }
       }
     } finally {

@@ -145,6 +145,7 @@ async function executeGroupPostScraper(
       lastScrapeTimestamp: lastScrapeTimestamp || undefined,
       maxPosts,
       scrollTimeout: options.scrollTimeout,
+      groupDelay: options.groupDelay,
     },
     json: true,
   });
@@ -292,6 +293,13 @@ export class FacebookAutomation implements INodeType {
         placeholder: 'Add Option',
         default: {},
         options: [
+          {
+            displayName: 'Group Delay (ms)',
+            name: 'groupDelay',
+            type: 'number',
+            default: 30000,
+            description: 'Delay between scraping each group to avoid rate-limiting (in milliseconds)',
+          },
           {
             displayName: 'Scroll Timeout (ms)',
             name: 'scrollTimeout',

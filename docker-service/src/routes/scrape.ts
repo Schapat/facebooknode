@@ -13,6 +13,7 @@ const postScraperSchema = z.object({
   lastScrapeTimestamp: z.string().optional(),
   maxPosts: z.number().optional(),
   scrollTimeout: z.number().optional(),
+  groupDelay: z.number().optional(),
   priority: z.number().optional(),
 });
 
@@ -42,6 +43,7 @@ export function registerScrapeRoutes(
           lastScrapeTimestamp: { type: 'string' },
           maxPosts: { type: 'number' },
           scrollTimeout: { type: 'number' },
+          groupDelay: { type: 'number' },
           priority: { type: 'number' },
         },
       },
@@ -57,6 +59,7 @@ export function registerScrapeRoutes(
           lastScrapeTimestamp: body.lastScrapeTimestamp,
           maxPosts: body.maxPosts,
           scrollTimeout: body.scrollTimeout,
+          groupDelay: body.groupDelay,
         },
         priority: body.priority,
       });
