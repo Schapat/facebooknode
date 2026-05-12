@@ -159,10 +159,10 @@ export class MQTTMessenger {
 
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
-        result.error = 'Connection timeout (10s)';
+        result.error = 'Connection timeout (15s)';
         this.disconnect();
         resolve(result);
-      }, 10000);
+      }, 15000);
 
       try {
         this.ws = new WebSocket('wss://edge-chat.facebook.com/chat', {
@@ -175,6 +175,14 @@ export class MQTTMessenger {
         });
 
         this.ws.binaryType = 'arraybuffer';
+
+        this.ws.on('upgrade', (response) => {
+          result.upgradeStatus = response.statusCode;
+          result.upgradeHeaders = Object.fromEntries(
+            Object.entries(response.headers).filter(([k]) => !k.startsWith('sec-'))
+          );
+          log.info({ status: response.statusCode }, 'WebSocket upgrade response');
+        });
 
         this.ws.on('open', () => {
           result.wsConnected = true;
@@ -427,76 +435,32 @@ export class MQTTMessenger {
   }
 
   /**
-   * Build MQTToT CONNECT packet with Thrift compact binary username
+   * Build MQTToT CONNECT packet - try JSON format (web client uses this)
    */
   private buildConnectPacket(): Buffer {
-    // Build Thrift compact binary for username/payload
-    const thrift = new ThriftWriter();
+    // The web client sends JSON username, not Thrift
+    const usernameJson = JSON.stringify({
+      u: this.userId,
+      s: this.sessionId,
+      chat_on: true,
+      fg: false,
+      d: this.deviceId,
+      ct: 'websocket',
+      mqtt_sid: '',
+      aid: FB_APP_ID,
+      st: [],
+      pm: [],
+      cp: 3,
+      ecp: 10,
+      chat_rows: 10,
+      fetches: [],
+      on_ack: true,
+      pf: 'jz',
+      on_log: false,
+    });
 
-    // Field 1: user_id (string)
-    thrift.writeField(1, THRIFT_BINARY);
-    thrift.writeString(this.userId);
-
-    // Field 2: user_agent (string) - browser UA
-    thrift.writeField(2, THRIFT_BINARY);
-    thrift.writeString('[FBAN/Orca-Threads/FBIOS;FBAV/248.1.0.24.111;FBDM/{density=3.0,width=1170,height=2532};FBLC/en_US;FBBK/1;]');
-
-    // Field 3: capabilities (i64) - chat capabilities bitmask
-    thrift.writeField(3, THRIFT_I64);
-    thrift.writeI64(BigInt('8831014'));
-
-    // Field 4: capabilities2 (i64) - extended capabilities
-    thrift.writeField(4, THRIFT_I64);
-    thrift.writeI64(BigInt('27'));
-
-    // Field 5: require_ack (bool) = true
-    thrift.writeField(5, THRIFT_BOOL_TRUE);
-
-    // Field 6: no_auto_foreground (bool) = true
-    thrift.writeField(6, THRIFT_BOOL_TRUE);
-
-    // Field 7: device_id (string)
-    thrift.writeField(7, THRIFT_BINARY);
-    thrift.writeString(this.deviceId);
-
-    // Field 8: is_initially_foreground (bool) = false
-    thrift.writeField(8, THRIFT_BOOL_FALSE);
-
-    // Field 9: network_type (i32) = 1 (wifi)
-    thrift.writeField(9, THRIFT_I32);
-    thrift.writeI32(1);
-
-    // Field 10: network_subtype (i32) = 0
-    thrift.writeField(10, THRIFT_I32);
-    thrift.writeI32(0);
-
-    // Field 11: mqtt_sid (i64)
-    thrift.writeField(11, THRIFT_I64);
-    thrift.writeI64(BigInt(this.sessionId));
-
-    // Field 12: subscribe_topics (list<i32>)
-    const topics = [TOPIC_T_MS]; // subscribe to messages
-    thrift.writeField(12, THRIFT_LIST);
-    thrift.writeListHeader(THRIFT_I32, topics.length);
-    for (const t of topics) thrift.writeI32(t);
-
-    // Field 13: client_stack (string)
-    thrift.writeField(13, THRIFT_BINARY);
-    thrift.writeString('3');
-
-    // Field 14: no_diff (i64)
-    thrift.writeField(14, THRIFT_I64);
-    thrift.writeI64(1n);
-
-    // Field 20: app_id (i64)
-    thrift.writeField(20, THRIFT_I64);
-    thrift.writeI64(BigInt(FB_APP_ID));
-
-    thrift.writeStop();
-
-    // Compress the Thrift binary with zlib
-    const thriftBuf = thrift.toBuffer();
-    const compressed = zlib.deflateRawSync(thriftBuf);
+    // Compress with raw deflate (no zlib header/trailer)
+    const compressed = zlib.deflateRawSync(Buffer.from(usernameJson));
 
     // Protocol name: "MQTToT"
     const protocolName = Buffer.from('MQTToT');
@@ -522,7 +486,7 @@ export class MQTTMessenger {
     clientIdLen.writeUInt16BE(clientIdStr.length, 0);
     const clientId = Buffer.concat([clientIdLen, clientIdStr]);
 
-    // Username = compressed Thrift binary
+    // Username = compressed JSON
     const usernameLen = Buffer.alloc(2);
     usernameLen.writeUInt16BE(compressed.length, 0);
 
