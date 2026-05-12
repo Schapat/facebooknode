@@ -147,14 +147,16 @@ export class AutoMessage {
           referer: 'https://www.facebook.com/',
         });
         // Search for version_id or schemaVersion in the SPA JavaScript
+        // The version_id is typically a large number (13-19 digits)
         const versionPatterns = [
-          /version_id['"]\s*:\s*['"]([\d]+)['"]/,
-          /schemaVersion['"]\s*:\s*['"]([\d]+)['"]/,
-          /"lsVersion"\s*:\s*"(\d+)"/,
-          /LS_VERSION['"]\s*[=:]\s*['"]([\d]+)['"]/,
-          /ls_version['"]\s*:\s*['"]([\d]+)['"]/,
-          /syncParams[^}]*version['"]\s*:\s*['"]([\d]+)['"]/,
-          /"version"\s*:\s*(\d{10,})/,
+          /version_id["']\s*:\s*["'](\d{10,20})["']/,
+          /schemaVersion["']\s*:\s*["'](\d{10,20})["']/,
+          /"lsVersion"\s*:\s*"(\d{10,20})"/,
+          /ls_version["']\s*:\s*["'](\d{10,20})["']/,
+          /syncParams[^}]*version["']\s*:\s*["'](\d+)["']/,
+          /"version"\s*:\s*"?(\d{13,20})"?/,
+          /LSVersion[^"]*"(\d{10,20})"/,
+          /currentVersion[^"]*"(\d{10,20})"/,
         ];
         for (const pat of versionPatterns) {
           const m = messengerPage.body.match(pat);
@@ -164,75 +166,94 @@ export class AutoMessage {
             break;
           }
         }
-        // Also search for all large numbers near "version" 
-        const versionContext: string[] = [];
-        const vContextPattern = /version[^"]*"(\d{10,20})"/gi;
-        let vc;
-        while ((vc = vContextPattern.exec(messengerPage.body)) !== null) {
-          if (!versionContext.includes(vc[1])) versionContext.push(vc[1]);
-          if (versionContext.length >= 10) break;
+        // Broader search: find all contexts where "version" appears near large numbers
+        const contextSnippets: string[] = [];
+        // Look around every "version" occurrence
+        const versionIndex = messengerPage.body.indexOf('ersion');
+        const indices: number[] = [];
+        let searchFrom = 0;
+        while (indices.length < 20) {
+          const idx = messengerPage.body.indexOf('ersion', searchFrom);
+          if (idx === -1) break;
+          indices.push(idx);
+          searchFrom = idx + 6;
         }
-        results.versionCandidates = versionContext;
+        for (const idx of indices) {
+          const context = messengerPage.body.substring(Math.max(0, idx - 30), idx + 80);
+          // Check if there's a large number nearby
+          const numMatch = context.match(/(\d{10,20})/);
+          if (numMatch) {
+            contextSnippets.push(context.replace(/[\n\r]/g, ' ').substring(0, 100));
+          }
+        }
+        results.versionContexts = contextSnippets;
         results.messengerPageLength = messengerPage.body.length;
       } catch (error) {
         results.versionExtractError = error instanceof Error ? error.message : String(error);
       }
       results.versionId = versionId;
 
-      // Try sending with discovered version_id
+      // Try sending with discovered version_id, and also with fallback version
       const timestamp = Date.now();
       const otid = `${timestamp}${Math.floor(Math.random() * 1000000000)}`;
+      const versionsToTry = [versionId];
+      if (versionId !== '9477666248971112') versionsToTry.push('9477666248971112');
 
-      const gqlBody = new URLSearchParams({
-        fb_dtsg: fbDtsg,
-        jazoest,
-        lsd,
-        fb_api_caller_class: 'RelayModern',
-        fb_api_req_friendly_name: 'LSPlatformGraphQLLightspeedRequestQuery',
-        variables: JSON.stringify({
-          deviceId: `device_${myUserId}_${timestamp}`,
-          requestId: 0,
-          requestPayload: JSON.stringify({
-            version_id: versionId,
-            tasks: [{
-              label: '46',
-              payload: JSON.stringify({
-                thread_id: recipientId,
-                otid,
-                source: 0,
-                send_type: 1,
-                text: 'Test Nachricht von der Automatisierung',
-              }),
-              queue_name: recipientId,
-              task_id: 1,
-              failure_count: null,
-            }],
-            epoch_id: timestamp,
+      for (const vid of versionsToTry) {
+        const gqlBody = new URLSearchParams({
+          fb_dtsg: fbDtsg,
+          jazoest,
+          lsd,
+          fb_api_caller_class: 'RelayModern',
+          fb_api_req_friendly_name: 'LSPlatformGraphQLLightspeedRequestQuery',
+          variables: JSON.stringify({
+            deviceId: `device_${myUserId}_${timestamp}`,
+            requestId: 0,
+            requestPayload: JSON.stringify({
+              version_id: vid,
+              tasks: [{
+                label: '46',
+                payload: JSON.stringify({
+                  thread_id: recipientId,
+                  otid: `${timestamp}${Math.floor(Math.random() * 1000000000)}`,
+                  source: 0,
+                  send_type: 1,
+                  text: 'Test Nachricht',
+                }),
+                queue_name: recipientId,
+                task_id: 1,
+                failure_count: null,
+              }],
+              epoch_id: timestamp,
+            }),
+            requestType: 3,
           }),
-          requestType: 3,
-        }),
-        doc_id: LS_DOC_ID,
-        __a: '1',
-      }).toString();
+          doc_id: LS_DOC_ID,
+          __a: '1',
+        }).toString();
 
-      try {
-        const gqlResp = await this.httpClient.post(
-          'https://www.facebook.com/api/graphql/',
-          gqlBody,
-          { referer: 'https://www.facebook.com/messages/' },
-        );
-        const cleanBody = gqlResp.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
-        const hasFailed = cleanBody.includes('markOptimisticMessageFailed');
-        const hasSuccess = cleanBody.includes('replaceOptimisticMessage') || cleanBody.includes('insertMessage');
-        results['send-result'] = {
-          statusCode: gqlResp.statusCode,
-          bodyLength: gqlResp.body.length,
-          hasFailed,
-          hasSuccess,
-          snippet: cleanBody.substring(0, 1000),
-        };
-      } catch (error) {
-        results['send-result'] = { error: error instanceof Error ? error.message : String(error) };
+        try {
+          const gqlResp = await this.httpClient.post(
+            'https://www.facebook.com/api/graphql/',
+            gqlBody,
+            { referer: 'https://www.facebook.com/messages/' },
+          );
+          const cleanBody = gqlResp.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
+          const hasFailed = cleanBody.includes('markOptimisticMessageFailed');
+          const hasSuccess = cleanBody.includes('replaceOptimisticMessage') || cleanBody.includes('insertMessage');
+          const hasRefresh = cleanBody.includes('forceWebClientRefresh');
+          results[`send-v${vid.substring(0, 8)}`] = {
+            versionId: vid,
+            statusCode: gqlResp.statusCode,
+            bodyLength: gqlResp.body.length,
+            hasFailed,
+            hasSuccess,
+            hasRefresh,
+            snippet: cleanBody.substring(0, 1000),
+          };
+        } catch (error) {
+          results[`send-v${vid.substring(0, 8)}`] = { versionId: vid, error: error instanceof Error ? error.message : String(error) };
+        }
       }
     }
 
