@@ -146,15 +146,26 @@ export class AutoMessage {
         const messengerPage = await this.httpClient.request('https://www.facebook.com/messages/', {
           referer: 'https://www.facebook.com/',
         });
-        // Search for LS database schema version in the SPA
-        // It's typically a 16-19 digit number near specific keywords
+
+        // Strategy 1: Search for LS database version in __d() module definitions
+        // Facebook SPA uses __d("ModuleName",...) to define JS modules
+        const lsModuleMatches: string[] = [];
+        const modulePattern = /__d\("([^"]*(?:LS|Lightspeed|lightspeed|Database)[^"]*)"/gi;
+        let mm;
+        while ((mm = modulePattern.exec(messengerPage.body)) !== null) {
+          lsModuleMatches.push(mm[1]);
+          if (lsModuleMatches.length >= 20) break;
+        }
+        results.lsModules = lsModuleMatches;
+
+        // Strategy 2: Search for known version-related patterns
         const versionPatterns = [
           /["']schemaVersion["']\s*:\s*["']?(\d{13,20})["']?/i,
           /["']version_id["']\s*:\s*["'](\d{13,20})["']/i,
           /["']lsVersion["']\s*:\s*["'](\d{13,20})["']/i,
-          /syncParams[^}]*["']version["']\s*:\s*["']?(\d{13,20})["']?/i,
           /databaseVersion['"]\s*:\s*['"]*(\d{13,20})/i,
           /["']currentDatabaseVersion["']\s*:\s*(\d{13,20})/i,
+          /sp_(?:version|ver|v)\s*[:=]\s*["']?(\d{13,20})["']?/i,
         ];
         for (const pat of versionPatterns) {
           const m = messengerPage.body.match(pat);
@@ -164,23 +175,39 @@ export class AutoMessage {
             break;
           }
         }
-        // Broader search: find all 16-digit numbers in the SPA (potential version IDs)
-        // that are NOT doc_ids (which we already know)
+
+        // Strategy 3: Look for contexts around "database", "schema", "LS" with large numbers
+        const contextKeywords = ['DatabaseVersion', 'SchemaVersion', 'LSVersion', 'ls_version', 'spVersion', 'syncVersion'];
+        const keywordContexts: Record<string, string> = {};
+        for (const kw of contextKeywords) {
+          const idx = messengerPage.body.indexOf(kw);
+          if (idx !== -1) {
+            keywordContexts[kw] = messengerPage.body.substring(idx, idx + 120).replace(/[\n\r]/g, ' ');
+          }
+        }
+        // Also look for "version" near "lightspeed" or "LS"
+        const lsIdx = messengerPage.body.indexOf('"LSPlatform');
+        if (lsIdx !== -1) {
+          keywordContexts['LSPlatform'] = messengerPage.body.substring(lsIdx, lsIdx + 200).replace(/[\n\r]/g, ' ');
+        }
+        results.keywordContexts = keywordContexts;
+
+        // Strategy 4: Extract all 16-19 digit numbers
         const allLargeNums = new Set<string>();
         const numPattern = /[=:,\[]\s*"?(\d{16,19})"?/g;
         let nm;
         while ((nm = numPattern.exec(messengerPage.body)) !== null) {
           allLargeNums.add(nm[1]);
-          if (allLargeNums.size >= 30) break;
+          if (allLargeNums.size >= 50) break;
         }
-        results.largeNumbers = Array.from(allLargeNums).slice(0, 30);
+        results.largeNumbers = Array.from(allLargeNums).slice(0, 50);
         results.messengerPageLength = messengerPage.body.length;
       } catch (error) {
         results.versionExtractError = error instanceof Error ? error.message : String(error);
       }
       results.versionId = versionId;
 
-      // Step 1: Try a SYNC request (requestType=1) to get current database version
+      // Step 1: Try a SYNC request (requestType=1) with known version to get current version
       try {
         const syncBody = new URLSearchParams({
           fb_dtsg: fbDtsg,
@@ -192,9 +219,12 @@ export class AutoMessage {
             deviceId: `device_${myUserId}_${Date.now()}`,
             requestId: 0,
             requestPayload: JSON.stringify({
-              version_id: '0',
+              version_id: '9477666248971112',
+              database: 1,
+              epoch_id: 0,
+              last_applied_cursor: null,
+              sync_params: '',
               tasks: [],
-              epoch_id: Date.now(),
             }),
             requestType: 1,  // SYNC — not execute
           }),
@@ -216,7 +246,7 @@ export class AutoMessage {
         results['sync-request'] = {
           statusCode: syncResp.statusCode,
           bodyLength: syncResp.body.length,
-          snippet: syncClean.substring(0, 800),
+          snippet: syncClean.substring(0, 2000),
         };
       } catch (error) {
         results['sync-request'] = { error: error instanceof Error ? error.message : String(error) };
@@ -282,7 +312,7 @@ export class AutoMessage {
             hasFailed,
             hasSuccess,
             hasRefresh,
-            snippet: cleanBody.substring(0, 1000),
+            snippet: cleanBody.substring(0, 2000),
           };
         } catch (error) {
           results[`send-v${vid.substring(0, 8)}`] = { versionId: vid, error: error instanceof Error ? error.message : String(error) };
