@@ -9,20 +9,108 @@ const log = createChildLogger({ service: 'MQTTMessenger' });
 const FB_APP_ID = 219994525426954;
 
 // MQTT packet types
-const PACKET_CONNECT = 1;
 const PACKET_CONNACK = 2;
 const PACKET_PUBLISH = 3;
 const PACKET_PUBACK = 4;
 const PACKET_SUBSCRIBE = 8;
-const PACKET_SUBACK = 9;
 const PACKET_PINGREQ = 12;
 const PACKET_PINGRESP = 13;
+
+// Thrift Compact Protocol types
+const THRIFT_BOOL_TRUE = 1;
+const THRIFT_BOOL_FALSE = 2;
+const THRIFT_I32 = 5;
+const THRIFT_I64 = 6;
+const THRIFT_BINARY = 8; // string and binary
+const THRIFT_LIST = 9;
+
+// Topic IDs for subscribe_topics field in CONNECT
+const TOPIC_T_MS = 1; // /t_ms (messages)
 
 interface MQTTMessage {
   topic: string;
   payload: Buffer;
   qos: number;
   messageId?: number;
+}
+
+// ── Thrift Compact Protocol Writer ─────────────────────────────────
+class ThriftWriter {
+  private buf: number[] = [];
+  private lastFieldId = 0;
+
+  writeField(fieldId: number, type: number): void {
+    const delta = fieldId - this.lastFieldId;
+    if (delta > 0 && delta <= 15) {
+      this.buf.push((delta << 4) | type);
+    } else {
+      this.buf.push(type);
+      this.writeI16Raw(fieldId);
+    }
+    this.lastFieldId = fieldId;
+  }
+
+  writeI32(value: number): void {
+    this.writeVarint(this.zigzag32(value));
+  }
+
+  writeI64(value: bigint): void {
+    this.writeVarintBig(this.zigzag64(value));
+  }
+
+  writeString(value: string): void {
+    const bytes = Buffer.from(value, 'utf-8');
+    this.writeVarint(bytes.length);
+    for (const b of bytes) this.buf.push(b);
+  }
+
+  writeListHeader(elemType: number, count: number): void {
+    if (count < 15) {
+      this.buf.push((count << 4) | elemType);
+    } else {
+      this.buf.push(0xf0 | elemType);
+      this.writeVarint(count);
+    }
+  }
+
+  writeStop(): void {
+    this.buf.push(0);
+  }
+
+  toBuffer(): Buffer {
+    return Buffer.from(this.buf);
+  }
+
+  private writeVarint(value: number): void {
+    value = value >>> 0; // unsigned
+    while (value > 0x7f) {
+      this.buf.push((value & 0x7f) | 0x80);
+      value >>>= 7;
+    }
+    this.buf.push(value & 0x7f);
+  }
+
+  private writeVarintBig(value: bigint): void {
+    if (value < 0n) value = value + (1n << 64n); // handle negative
+    while (value > 0x7fn) {
+      this.buf.push(Number(value & 0x7fn) | 0x80);
+      value >>= 7n;
+    }
+    this.buf.push(Number(value & 0x7fn));
+  }
+
+  private writeI16Raw(value: number): void {
+    // Zigzag + varint for i16
+    this.writeVarint((value << 1) ^ (value >> 15));
+  }
+
+  private zigzag32(n: number): number {
+    return (n << 1) ^ (n >> 31);
+  }
+
+  private zigzag64(n: bigint): bigint {
+    return (n << 1n) ^ (n >> 63n);
+  }
 }
 
 export class MQTTMessenger {
@@ -102,8 +190,13 @@ export class MQTTMessenger {
         this.ws.on('message', (data: ArrayBuffer) => {
           const buf = Buffer.from(data);
           const packetType = (buf[0] >> 4) & 0x0f;
+          const rawHex = buf.subarray(0, Math.min(50, buf.length)).toString('hex');
 
-          log.info({ packetType, size: buf.length, hex: buf.subarray(0, 20).toString('hex') }, 'Received MQTT packet');
+          log.info({ packetType, size: buf.length, hex: rawHex }, 'Received MQTT packet');
+
+          // Store all raw responses for diagnostics
+          if (!result.rawPackets) result.rawPackets = [];
+          (result.rawPackets as string[]).push(`type=${packetType} size=${buf.length} hex=${rawHex}`);
 
           if (packetType === PACKET_CONNACK) {
             // CONNACK: byte 0 = type, byte 1 = remaining length, byte 2 = flags, byte 3 = return code
@@ -134,7 +227,7 @@ export class MQTTMessenger {
           } else if (packetType === PACKET_PINGREQ) {
             // Respond to PING
             this.ws!.send(Buffer.from([PACKET_PINGRESP << 4, 0]));
-          } else if (packetType === PACKET_SUBACK) {
+          } else if (packetType === 9) { // SUBACK
             log.info('Received SUBACK');
           }
         });
@@ -334,63 +427,109 @@ export class MQTTMessenger {
   }
 
   /**
-   * Build MQTToT CONNECT packet
+   * Build MQTToT CONNECT packet with Thrift compact binary username
    */
   private buildConnectPacket(): Buffer {
-    // Username: zlib-compressed JSON config
-    const usernameJson = JSON.stringify({
-      u: this.userId,
-      s: this.sessionId,
-      chat_on: true,
-      fg: false,
-      d: this.deviceId,
-      ct: 'websocket',
-      mqtt_sid: '',
-      aid: FB_APP_ID,
-      st: [],
-      pm: [],
-      cp: 3,
-      ecp: 10,
-      chat_rows: 10,
-      fetches: [],
-      on_ack: true,
-      pf: 'jz',
-      on_log: false,
-    });
-    const usernameCompressed = zlib.deflateSync(Buffer.from(usernameJson));
+    // Build Thrift compact binary for username/payload
+    const thrift = new ThriftWriter();
+
+    // Field 1: user_id (string)
+    thrift.writeField(1, THRIFT_BINARY);
+    thrift.writeString(this.userId);
+
+    // Field 2: user_agent (string) - browser UA
+    thrift.writeField(2, THRIFT_BINARY);
+    thrift.writeString('[FBAN/Orca-Threads/FBIOS;FBAV/248.1.0.24.111;FBDM/{density=3.0,width=1170,height=2532};FBLC/en_US;FBBK/1;]');
+
+    // Field 3: capabilities (i64) - chat capabilities bitmask
+    thrift.writeField(3, THRIFT_I64);
+    thrift.writeI64(BigInt('8831014'));
+
+    // Field 4: capabilities2 (i64) - extended capabilities
+    thrift.writeField(4, THRIFT_I64);
+    thrift.writeI64(BigInt('27'));
+
+    // Field 5: require_ack (bool) = true
+    thrift.writeField(5, THRIFT_BOOL_TRUE);
+
+    // Field 6: no_auto_foreground (bool) = true
+    thrift.writeField(6, THRIFT_BOOL_TRUE);
+
+    // Field 7: device_id (string)
+    thrift.writeField(7, THRIFT_BINARY);
+    thrift.writeString(this.deviceId);
+
+    // Field 8: is_initially_foreground (bool) = false
+    thrift.writeField(8, THRIFT_BOOL_FALSE);
+
+    // Field 9: network_type (i32) = 1 (wifi)
+    thrift.writeField(9, THRIFT_I32);
+    thrift.writeI32(1);
+
+    // Field 10: network_subtype (i32) = 0
+    thrift.writeField(10, THRIFT_I32);
+    thrift.writeI32(0);
+
+    // Field 11: mqtt_sid (i64)
+    thrift.writeField(11, THRIFT_I64);
+    thrift.writeI64(BigInt(this.sessionId));
+
+    // Field 12: subscribe_topics (list<i32>)
+    const topics = [TOPIC_T_MS]; // subscribe to messages
+    thrift.writeField(12, THRIFT_LIST);
+    thrift.writeListHeader(THRIFT_I32, topics.length);
+    for (const t of topics) thrift.writeI32(t);
+
+    // Field 13: client_stack (string)
+    thrift.writeField(13, THRIFT_BINARY);
+    thrift.writeString('3');
+
+    // Field 14: no_diff (i64)
+    thrift.writeField(14, THRIFT_I64);
+    thrift.writeI64(1n);
+
+    // Field 20: app_id (i64)
+    thrift.writeField(20, THRIFT_I64);
+    thrift.writeI64(BigInt(FB_APP_ID));
+
+    thrift.writeStop();
+
+    // Compress the Thrift binary with zlib
+    const thriftBuf = thrift.toBuffer();
+    const compressed = zlib.deflateSync(thriftBuf);
 
     // Protocol name: "MQTToT"
     const protocolName = Buffer.from('MQTToT');
     const protocolNameLen = Buffer.alloc(2);
     protocolNameLen.writeUInt16BE(protocolName.length, 0);
 
-    // Protocol level
+    // Protocol level: 3
     const protocolLevel = Buffer.from([3]);
 
-    // Connect flags: clean session + username + password
+    // Connect flags: username(0x80) + password(0x40) + clean_session(0x02) = 0xC2
     const connectFlags = Buffer.from([0xc2]);
 
-    // Keep alive (60 seconds)
+    // Keep alive: 60 seconds
     const keepAlive = Buffer.alloc(2);
     keepAlive.writeUInt16BE(60, 0);
 
     // Variable header
     const variableHeader = Buffer.concat([protocolNameLen, protocolName, protocolLevel, connectFlags, keepAlive]);
 
-    // Client ID (empty)
+    // Client ID (empty string)
     const clientId = Buffer.alloc(2);
     clientId.writeUInt16BE(0, 0);
 
-    // Username
+    // Username = compressed Thrift binary
     const usernameLen = Buffer.alloc(2);
-    usernameLen.writeUInt16BE(usernameCompressed.length, 0);
+    usernameLen.writeUInt16BE(compressed.length, 0);
 
     // Password (empty)
     const password = Buffer.alloc(2);
     password.writeUInt16BE(0, 0);
 
     // Payload
-    const payload = Buffer.concat([clientId, usernameLen, usernameCompressed, password]);
+    const payload = Buffer.concat([clientId, usernameLen, compressed, password]);
 
     // Remaining length
     const remainingLength = variableHeader.length + payload.length;
