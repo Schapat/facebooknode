@@ -406,38 +406,66 @@ export class E2EESignalClient {
       referer: 'https://www.facebook.com/',
     });
 
-    // Extract LSVersion from JS bundles
-    const scriptPattern = /<script[^>]+src="([^"]*rsrc\.php[^"]*)"[^>]*>/g;
-    let sm;
-    const bundleUrls: string[] = [];
-    while ((sm = scriptPattern.exec(messengerPage.body)) !== null) {
-      bundleUrls.push(sm[1]);
+    log.info({ bodyLength: messengerPage.body.length, statusCode: messengerPage.statusCode }, 'Messenger page loaded');
+
+    // Strategy A: Extract from data-sjs preloader blocks (inline in HTML)
+    const sjsPattern = /<script[^>]+data-sjs[^>]*>([\s\S]*?)<\/script>/gi;
+    let sjsMatch;
+    while ((sjsMatch = sjsPattern.exec(messengerPage.body)) !== null) {
+      const block = sjsMatch[1];
+      // Look for LSVersion module definition in inline scripts
+      const inlineDefMatch = block.match(/__d\("LSVersion"[^)]*exports\s*=\s*"(\d+)"/);
+      if (inlineDefMatch && !this.lsVersion) {
+        this.lsVersion = inlineDefMatch[1];
+        log.info({ source: 'data-sjs-inline' }, 'Found LSVersion');
+      }
+      // Also check for version_id references
+      const versionMatch = block.match(/"version_id"\s*:\s*"(\d{13,20})"/);
+      if (versionMatch && !this.lsVersion) {
+        this.lsVersion = versionMatch[1];
+        log.info({ source: 'data-sjs-version_id' }, 'Found LSVersion');
+      }
     }
 
-    for (const url of bundleUrls) {
-      if (this.lsVersion) break;
-      try {
-        const fullUrl = url.startsWith('http') ? url : `https://static.xx.fbcdn.net${url}`;
-        const bundle = await this.httpClient.request(fullUrl, {
-          referer: 'https://www.facebook.com/messages/',
-        });
+    // Strategy B: Direct regex on full body
+    if (!this.lsVersion) {
+      const directMatch = messengerPage.body.match(/__d\("LSVersion"[^)]*exports\s*=\s*"(\d+)"/);
+      if (directMatch) {
+        this.lsVersion = directMatch[1];
+        log.info({ source: 'body-direct' }, 'Found LSVersion');
+      }
+    }
 
-        // Find __d("LSVersion",...) module definition
-        const defMatch = bundle.body.match(/__d\("LSVersion"[^)]*exports\s*=\s*"(\d+)"/);
-        if (defMatch) {
-          this.lsVersion = defMatch[1];
-        }
+    // Strategy C: Scan JS bundle files
+    if (!this.lsVersion) {
+      const scriptPattern = /<script[^>]+src="([^"]*rsrc\.php[^"]*)"[^>]*>/g;
+      let sm;
+      const bundleUrls: string[] = [];
+      while ((sm = scriptPattern.exec(messengerPage.body)) !== null) {
+        bundleUrls.push(sm[1]);
+      }
+      log.info({ bundleCount: bundleUrls.length }, 'Found JS bundles');
 
-        // Find E2EE related doc_ids
-        const e2eeUploadMatch = bundle.body.match(/e2ee[_\s]*(?:key|prekey)[_\s]*(?:upload|publish|register)[^"]*"(\d{13,20})"/i);
-        if (e2eeUploadMatch && !DOC_IDS.e2eeKeyUpload) {
-          DOC_IDS.e2eeKeyUpload = e2eeUploadMatch[1];
-        }
-        const e2eeFetchMatch = bundle.body.match(/e2ee[_\s]*(?:key|prekey)[_\s]*(?:fetch|get|bundle)[^"]*"(\d{13,20})"/i);
-        if (e2eeFetchMatch && !DOC_IDS.e2eeKeyFetch) {
-          DOC_IDS.e2eeKeyFetch = e2eeFetchMatch[1];
-        }
-      } catch { /* skip failed bundles */ }
+      for (const url of bundleUrls) {
+        if (this.lsVersion) break;
+        try {
+          const fullUrl = url.startsWith('http') ? url : `https://static.xx.fbcdn.net${url}`;
+          const bundle = await this.httpClient.request(fullUrl, {
+            referer: 'https://www.facebook.com/messages/',
+          });
+
+          // Find __d("LSVersion",...) module definition
+          const defIdx = bundle.body.indexOf('__d("LSVersion"');
+          if (defIdx !== -1) {
+            const ctx = bundle.body.substring(defIdx, defIdx + 200);
+            const exportsMatch = ctx.match(/exports\s*=\s*"(\d+)"/);
+            if (exportsMatch) {
+              this.lsVersion = exportsMatch[1];
+              log.info({ source: 'bundle' }, 'Found LSVersion');
+            }
+          }
+        } catch { /* skip failed bundles */ }
+      }
     }
 
     if (!this.lsVersion) {
