@@ -137,94 +137,95 @@ export class AutoMessage {
     }
 
     if (fbDtsg) {
-      // 4a. Test direct POST to send endpoints
-      const sendEndpoints = [
-        {
-          name: 'ajax-mercury',
-          url: 'https://www.facebook.com/ajax/mercury/send_messages.php',
-          referer: 'https://www.facebook.com/messages/',
-          body: new URLSearchParams({
-            fb_dtsg: fbDtsg,
-            jazoest,
-            lsd,
-            'message_batch[0][action_type]': 'ma-type:user-generated-message',
-            'message_batch[0][body]': 'Test von der Automatisierung',
-            'message_batch[0][specific_to_list][0]': `fbid:${recipientId}`,
-            'message_batch[0][specific_to_list][1]': `fbid:${myUserId}`,
-            'message_batch[0][has_attachment]': 'false',
-            'message_batch[0][source]': 'source:web',
-            'message_batch[0][timestamp]': String(Date.now()),
-            'message_batch[0][message_id]': `${Date.now()}${Math.floor(Math.random() * 10000)}`,
-            '__a': '1',
-          }).toString(),
-        },
-        {
-          name: 'messaging-send',
-          url: 'https://www.facebook.com/messaging/send/',
-          referer: 'https://www.facebook.com/messages/',
-          body: new URLSearchParams({
-            fb_dtsg: fbDtsg,
-            jazoest,
-            lsd,
-            body: 'Test von der Automatisierung',
-            'ids[0]': recipientId,
-            action_type: 'ma-type:user-generated-message',
-            has_attachment: 'false',
-            timestamp: String(Date.now()),
-            __a: '1',
-          }).toString(),
-        },
-      ];
-
-      for (const ep of sendEndpoints) {
-        try {
-          const resp = await this.httpClient.post(ep.url, ep.body, { referer: ep.referer });
-          const cleanBody = resp.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
-          results[ep.name] = {
-            statusCode: resp.statusCode,
-            bodyLength: resp.body.length,
-            isLoginPage: this.httpClient.isLoginPage(resp.body),
-            snippet: cleanBody.substring(0, 500),
-            hasError: cleanBody.includes('"error"') || cleanBody.includes('"errorSummary"'),
-            hasPayload: cleanBody.includes('"payload"'),
-          };
-        } catch (error) {
-          results[ep.name] = { error: error instanceof Error ? error.message : String(error) };
-        }
-      }
-
-      // 4b. Try GraphQL send mutation (LSPlatformGraphQLLightspeedRequestQuery)
+      // 4a. Search the Facebook SPA for messaging-related doc_ids
       try {
-        // Just probe if the graphql endpoint responds with something meaningful
-        const gqlBody = new URLSearchParams({
-          fb_dtsg: fbDtsg,
-          jazoest,
-          fb_api_caller_class: 'RelayModern',
-          fb_api_req_friendly_name: 'useSendMessageMutation',
-          variables: JSON.stringify({
-            input: {
-              otherUserFBID: recipientId,
-              message: { text: '' }, // empty — just probing
-              source: 'messenger:web',
-            },
-          }),
-          doc_id: '0', // placeholder — we need the real one
-          __a: '1',
-        }).toString();
+        const messengerPage = await this.httpClient.request('https://www.facebook.com/messages/', {
+          referer: 'https://www.facebook.com/',
+        });
+        // Search for doc_id patterns near messaging keywords
+        const docIdMatches: string[] = [];
+        // Pattern: e.id="DOCID" or doc_id:"DOCID" or preloadable_id:"DOCID"
+        const patterns = [
+          /(?:e\.id|doc_id|preloadable_id)\s*[=:]\s*"(\d{10,20})"/g,
+          /"queryID"\s*:\s*"(\d{10,20})"/g,
+          /__d\("(\d{10,20})"\)/g,
+        ];
+        for (const pattern of patterns) {
+          let m;
+          while ((m = pattern.exec(messengerPage.body)) !== null) {
+            if (!docIdMatches.includes(m[1])) docIdMatches.push(m[1]);
+          }
+        }
+        // Also search for doc_ids near "send" or "message" strings
+        const sendDocIds: string[] = [];
+        const sendPattern = /[Ss]end[Mm]essage[^"]*"[^"]*"(\d{10,20})"|"(\d{10,20})"[^"]*[Ss]end[Mm]essage/g;
+        let sm;
+        while ((sm = sendPattern.exec(messengerPage.body)) !== null) {
+          const id = sm[1] || sm[2];
+          if (id && !sendDocIds.includes(id)) sendDocIds.push(id);
+        }
+        // Search for LSPlatform related doc_ids
+        const lsPattern = /LSPlatform[^"]*"[^"]*"(\d{10,20})"|"(\d{10,20})"[^"]*LSPlatform/g;
+        while ((sm = lsPattern.exec(messengerPage.body)) !== null) {
+          const id = sm[1] || sm[2];
+          if (id && !sendDocIds.includes(id)) sendDocIds.push(id);
+        }
 
-        const gqlResp = await this.httpClient.post(
-          'https://www.facebook.com/api/graphql/',
-          gqlBody,
-          { referer: 'https://www.facebook.com/messages/' },
-        );
-        const cleanBody = gqlResp.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
-        results['graphql-send'] = {
-          statusCode: gqlResp.statusCode,
-          bodyLength: gqlResp.body.length,
-          snippet: cleanBody.substring(0, 500),
+        results['docIdSearch'] = {
+          messengerPageLength: messengerPage.body.length,
+          totalDocIdsFound: docIdMatches.length,
+          firstFewDocIds: docIdMatches.slice(0, 20),
+          sendRelatedDocIds: sendDocIds,
         };
       } catch (error) {
-        results['graphql-send'] = { error: error instanceof Error ? error.message : String(error) };
+        results['docIdSearch'] = { error: error instanceof Error ? error.message : String(error) };
+      }
+
+      // 4b. Try known GraphQL doc_ids for message sending
+      const knownDocIds: Record<string, string> = {
+        'LSPlatformGraphQLLightspeedRequestQuery': '9661553617234498',
+        'SendMessageMutation': '7005893949479032',
+        'useSendMessageMutation_v2': '6939660172744766',
+        'CometMessageComposerMutation': '8610923455643158',
+        'LSGraphQLRequest': '8017539361632270',
+      };
+
+      for (const [name, docId] of Object.entries(knownDocIds)) {
+        try {
+          const gqlBody = new URLSearchParams({
+            fb_dtsg: fbDtsg,
+            jazoest,
+            lsd,
+            fb_api_caller_class: 'RelayModern',
+            fb_api_req_friendly_name: name,
+            variables: JSON.stringify({
+              input: {
+                otherUserFBID: recipientId,
+                message: { text: '' },
+                source: 'messenger:web',
+              },
+            }),
+            doc_id: docId,
+            __a: '1',
+          }).toString();
+
+          const gqlResp = await this.httpClient.post(
+            'https://www.facebook.com/api/graphql/',
+            gqlBody,
+            { referer: 'https://www.facebook.com/messages/' },
+          );
+          const cleanBody = gqlResp.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
+          const isNotFound = cleanBody.includes('1357031') || cleanBody.includes('was not found');
+          results[`graphql-${name}`] = {
+            docId,
+            statusCode: gqlResp.statusCode,
+            bodyLength: gqlResp.body.length,
+            isNotFound,
+            snippet: cleanBody.substring(0, 500),
+          };
+        } catch (error) {
+          results[`graphql-${name}`] = { docId, error: error instanceof Error ? error.message : String(error) };
+        }
       }
     }
 
