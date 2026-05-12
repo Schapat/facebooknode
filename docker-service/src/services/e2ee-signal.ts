@@ -361,7 +361,8 @@ export class E2EESignalClient {
   }
 
   /**
-   * Scan Messenger page and JS bundles for E2EE-related endpoint info.
+   * Scan Messenger bundles for the exact task-46 payload schema
+   * and E2EE send mechanisms.
    */
   private async scanForE2EEInfo(): Promise<Record<string, unknown>> {
     const info: Record<string, unknown> = {};
@@ -370,55 +371,19 @@ export class E2EESignalClient {
       referer: 'https://www.facebook.com/',
     });
 
-    // Search HTML for E2EE sync params (e.g. e2ee sync group config)
-    const e2eeSyncMatch = messengerPage.body.match(/"e2ee"\s*:\s*"([^"]{0,200})"/);
-    info.e2eeSyncParams = e2eeSyncMatch ? e2eeSyncMatch[1] : null;
-
-    // Search for Armadillo/WA-related module names in the HTML
-    const armadilloTerms = ['WASendMsgUtil', 'WAGenerateAndUpload', 'WAGetIdentity', 'armadillo',
-      'Armadillo', 'secureMessage', 'SecureMessage', 'LSInsertE2EE', 'sendE2ee',
-      'e2ee_send', 'LSE2EE', 'E2EESend', 'insertSecureMessage', 'SecureSend'];
-    const armadilloMatches: Record<string, string[]> = {};
-    for (const term of armadilloTerms) {
-      const contexts: string[] = [];
-      let from = 0;
-      while (contexts.length < 2) {
-        const idx = messengerPage.body.indexOf(term, from);
-        if (idx === -1) break;
-        const start = Math.max(0, idx - 40);
-        const end = Math.min(messengerPage.body.length, idx + term.length + 160);
-        contexts.push(messengerPage.body.substring(start, end).replace(/[\n\r]/g, ' '));
-        from = idx + term.length;
-      }
-      if (contexts.length > 0) armadilloMatches[term] = contexts;
-    }
-    info.armadilloMatches = armadilloMatches;
-
-    // Scan bundles for E2EE task/send-related code
+    // Scan bundles for task label definitions and E2EE send code
     const scriptPattern = /<script[^>]+src="([^"]*rsrc\.php[^"]*)"[^>]*>/g;
     let sm;
     const bundleUrls: string[] = [];
     while ((sm = scriptPattern.exec(messengerPage.body)) !== null) {
       bundleUrls.push(sm[1]);
     }
+    info.bundleCount = bundleUrls.length;
 
-    // Deep-scan first 6 bundles for specific E2EE send patterns
-    const bundleFindings: Record<string, string[]> = {};
-    const deepTerms = [
-      'sendE2ee', 'E2EESend', 'e2ee_send', 'armadilloSend', 'secureSend',
-      'LSInsertSecure', 'insertSecureMessage', 'LSSendSecure',
-      'label:46', 'label:"46"', 'label:\'46\'',
-      'e2ee_message', 'encryptedPayload', 'ciphertext',
-      'MWE2EESendMessage', 'MAWSendSecure', 'sendSecure',
-      'ARMADILLO_DEFAULT_E2EE', 'default_e2ee',
-      'preKeyRequest', 'getPreKeyBundle', 'fetchPreKey',
-      'identityKeyStore', 'preKeyStore',
-      'LSGetE2EE', 'LSSetE2EE', 'LSUpdateE2EE',
-      'getE2eeThread', 'getSecureThread',
-      '/messaging/e2ee/', '/messaging/encrypt/',
-    ];
+    // Deep-scan bundles for task label mappings and send functions
+    const findings: Record<string, string[]> = {};
 
-    for (let i = 0; i < Math.min(bundleUrls.length, 6); i++) {
+    for (let i = 0; i < Math.min(bundleUrls.length, 8); i++) {
       try {
         const fullUrl = bundleUrls[i].startsWith('http') ? bundleUrls[i] : `https://static.xx.fbcdn.net${bundleUrls[i]}`;
         const bundle = await this.httpClient.request(fullUrl, {
@@ -426,21 +391,61 @@ export class E2EESignalClient {
         });
 
         const contexts: string[] = [];
-        for (const term of deepTerms) {
+
+        // 1. Search for task label definitions near "46" or send
+        // Look for the task definition pattern: label:46 or "46":function
+        const taskPattern = /label['":\s]*4[56789]\b[^;]{0,300}/g;
+        let tm;
+        while ((tm = taskPattern.exec(bundle.body)) !== null && contexts.length < 5) {
+          contexts.push(`[b${i}:task:${tm.index}] ${tm[0].substring(0, 300)}`);
+        }
+
+        // 2. Search for "sendE2eeMessage" or similar function defs
+        for (const term of [
+          'sendE2eeMessage', 'sendSecureMessage', 'LSSendE2EE',
+          'LSVerifyAndInsertE2EE', 'insertE2eeMsg', 'e2eeSend',
+          'secureSendMessage', 'encryptAndSend', 'armadilloSend',
+          'MWE2EESend', 'MAWSend', 'processE2eeOutgoing',
+        ]) {
           let from = 0;
-          while (contexts.length < 30) {
+          while (contexts.length < 15) {
+            const idx = bundle.body.indexOf(term, from);
+            if (idx === -1) break;
+            const start = Math.max(0, idx - 60);
+            const end = Math.min(bundle.body.length, idx + term.length + 300);
+            contexts.push(`[b${i}:${term}:${idx}] ${bundle.body.substring(start, end).replace(/[\n\r]/g, ' ')}`);
+            from = idx + term.length;
+          }
+        }
+
+        // 3. Search for the actual send task payload fields
+        // The Task 46 payload has specific field names
+        for (const term of [
+          'thread_id', 'otid', 'send_type', 'sync_group', 'initiating_source',
+          'is_e2ee_message_', 'armadillo_message_payload',
+          'encrypted_serialized', 'ciphertext', 'signal_message',
+          'pni_signature_message', 'proto_message',
+        ]) {
+          let from = 0;
+          while (contexts.length < 25) {
             const idx = bundle.body.indexOf(term, from);
             if (idx === -1) break;
             const start = Math.max(0, idx - 80);
             const end = Math.min(bundle.body.length, idx + term.length + 200);
-            contexts.push(`[b${i}:${idx}] ${bundle.body.substring(start, end).replace(/[\n\r]/g, ' ')}`);
+            const ctx = bundle.body.substring(start, end).replace(/[\n\r]/g, ' ');
+            // Only include if it looks like a task/message definition
+            if (ctx.includes('task') || ctx.includes('label') || ctx.includes('payload') || 
+                ctx.includes('send') || ctx.includes('message') || ctx.includes('e2ee')) {
+              contexts.push(`[b${i}:${term}:${idx}] ${ctx}`);
+            }
             from = idx + term.length;
           }
         }
-        if (contexts.length > 0) bundleFindings[`bundle_${i}`] = contexts;
+
+        if (contexts.length > 0) findings[`bundle_${i}`] = contexts;
       } catch { /* skip */ }
     }
-    info.bundleFindings = bundleFindings;
+    info.findings = findings;
 
     return info;
   }
