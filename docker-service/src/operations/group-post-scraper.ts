@@ -34,8 +34,8 @@ export class GroupPostScraper {
         }
         // Delay between groups to avoid rate-limiting
         if (i < input.groups.length - 1) {
-          const baseDelay = input.groupDelay || 30000;
-          const jitter = Math.floor(Math.random() * 5000); // 0-5s random jitter
+          const baseDelay = input.groupDelay || 5000;
+          const jitter = Math.floor(Math.random() * 3000); // 0-3s random jitter
           const delayMs = baseDelay + jitter;
           log.info({ delayMs, nextGroup: input.groups[i + 1] }, 'Waiting before next group');
           await new Promise(resolve => setTimeout(resolve, delayMs));
@@ -75,7 +75,7 @@ export class GroupPostScraper {
           lastError.message.includes('Session expired');
 
         if (isRateLimit && attempt < maxRetries) {
-          const backoffMs = (attempt + 1) * 15000; // 15s, 30s
+          const backoffMs = (attempt + 1) * 10000; // 10s, 20s
           log.warn({ groupUrl, attempt: attempt + 1, backoffMs }, 'Rate-limited, backing off before retry');
           await new Promise(resolve => setTimeout(resolve, backoffMs));
           continue;
@@ -180,7 +180,7 @@ export class GroupPostScraper {
       page++;
       log.info({ page, postsCount: posts.length, maxPosts }, 'Fetching next page via GraphQL');
 
-      await randomDelay(1000, 3000);
+      await randomDelay(500, 1500);
 
       try {
         const graphqlPosts = await this.fetchGraphQLPage(

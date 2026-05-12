@@ -81,7 +81,7 @@ async function waitForJob(
   options: Record<string, unknown>,
 ): Promise<unknown> {
   const pollInterval = (options.pollInterval as number) || 5000;
-  const maxWaitTime = (options.maxWaitTime as number) || 300000;
+  const maxWaitTime = (options.maxWaitTime as number) || 600000;
   const startTime = Date.now();
 
   while (Date.now() - startTime < maxWaitTime) {
@@ -151,7 +151,14 @@ async function executeGroupPostScraper(
   });
 
   if (options.waitForCompletion !== false) {
-    return waitForJob(ctx, apiUrl, apiKey, response.jobId, options);
+    // Auto-scale maxWaitTime based on number of groups if not explicitly set
+    const autoOptions = { ...options };
+    if (!options.maxWaitTime) {
+      const groupDelay = (options.groupDelay as number) || 5000;
+      const estimatedTime = groups.length * (groupDelay + 10000); // delay + ~10s per group for scraping
+      autoOptions.maxWaitTime = Math.max(600000, estimatedTime);
+    }
+    return waitForJob(ctx, apiUrl, apiKey, response.jobId, autoOptions);
   }
 
   return response;
@@ -297,7 +304,7 @@ export class FacebookAutomation implements INodeType {
             displayName: 'Group Delay (ms)',
             name: 'groupDelay',
             type: 'number',
-            default: 30000,
+            default: 5000,
             description: 'Delay between scraping each group to avoid rate-limiting (in milliseconds)',
           },
           {
