@@ -235,33 +235,57 @@ export class AutoMessage {
       }
       results.versionId = versionId;
 
-      // Step 1: Try loading one JS bundle to find the LS version
+      // Step 1: Search data-sjs blocks, ALL JS bundles, and messenger.com for version
       try {
-        // Look for script bundles containing "Lightspeed" or "LSPlatform" config
-        const scriptPattern = /<script[^>]+src="([^"]*rsrc\.php[^"]*)"[^>]*>/g;
-        let sm;
+        // Strategy A: Parse data-sjs script blocks (Facebook embeds config here)
+        const sjsBlocks: string[] = [];
+        const sjsPattern = /<script[^>]+data-sjs[^>]*>([\s\S]*?)<\/script>/gi;
+        let sjsMatch;
+        while ((sjsMatch = sjsPattern.exec(messengerBody)) !== null) {
+          const block = sjsMatch[1];
+          // Only keep blocks that mention LS, lightspeed, version, or database
+          if (/lightspeed|LSPlatform|version_id|databaseVersion|schemaVersion|syncParams/i.test(block)) {
+            sjsBlocks.push(block.substring(0, 500));
+          }
+        }
+        results.sjsLsBlocks = sjsBlocks;
+
+        // Strategy B: Search ALL JS bundles (not just first 3)
+        const scriptPattern2 = /<script[^>]+src="([^"]*rsrc\.php[^"]*)"[^>]*>/g;
+        let sm2;
         const bundleUrls: string[] = [];
-        while ((sm = scriptPattern.exec(messengerBody)) !== null) {
-          bundleUrls.push(sm[1]);
+        while ((sm2 = scriptPattern2.exec(messengerBody)) !== null) {
+          bundleUrls.push(sm2[1]);
         }
         results.totalBundles = bundleUrls.length;
-        
-        // Load the first 3 bundles and search for version patterns
-        const bundleResults: Array<{url: string; size: number; found: string | null}> = [];
-        for (const url of bundleUrls.slice(0, 3)) {
+
+        const bundleResults: Array<{idx: number; size: number; found: string | null; lsHits: string[]}> = [];
+        for (let i = 0; i < bundleUrls.length; i++) {
+          const url = bundleUrls[i];
           try {
             const fullUrl = url.startsWith('http') ? url : `https://static.xx.fbcdn.net${url}`;
             const bundle = await this.httpClient.request(fullUrl, {
               referer: 'https://www.facebook.com/messages/',
             });
             let foundVersion: string | null = null;
-            // Search for version patterns in JS bundle
+
+            // Quick check: does this bundle contain LS-related code?
+            const lsHits: string[] = [];
+            const lsTerms = ['version_id', 'schemaVersion', 'databaseVersion', 'LSPlatformDatabase', 'currentDatabaseVersion'];
+            for (const term of lsTerms) {
+              const termIdx = bundle.body.indexOf(term);
+              if (termIdx !== -1) {
+                lsHits.push(`${term}@${termIdx}: ${bundle.body.substring(termIdx, termIdx + 100).replace(/[\n\r]/g, '')}`);
+              }
+            }
+
+            // Search for version patterns
             const bundlePatterns = [
               /LSPlatformDatabaseVersion[^;]*?["'](\d{13,20})["']/,
-              /databaseVersion['":\s]*(\d{13,20})/,
-              /schemaVersion['":\s]*(\d{13,20})/,
+              /databaseVersion['":\s]*(\d{13,20})/i,
+              /schemaVersion['":\s]*(\d{13,20})/i,
               /version_id['":\s]*["']?(\d{13,20})["']?/,
-              /ls_version['":\s]*(\d{13,20})/,
+              /currentDatabaseVersion['":\s]*(\d{13,20})/i,
             ];
             for (const pat of bundlePatterns) {
               const m = bundle.body.match(pat);
@@ -271,15 +295,54 @@ export class AutoMessage {
                 break;
               }
             }
-            bundleResults.push({
-              url: url.substring(url.length - 40),
-              size: bundle.body.length,
-              found: foundVersion,
-            });
+
+            // Only include bundles with LS hits or found version
+            if (lsHits.length > 0 || foundVersion) {
+              bundleResults.push({ idx: i, size: bundle.body.length, found: foundVersion, lsHits });
+            }
             if (foundVersion) break;
           } catch { /* skip failed bundles */ }
         }
         results.bundleSearch = bundleResults;
+
+        // Strategy C: Try messenger.com for the version
+        if (versionId === '0') {
+          try {
+            const messengerCom = await this.httpClient.request('https://www.messenger.com/', {
+              referer: 'https://www.messenger.com/',
+            });
+            // Search for version patterns
+            const mcPatterns = [
+              /["']schemaVersion["']\s*:\s*["']?(\d{13,20})["']?/i,
+              /["']version_id["']\s*:\s*["'](\d{13,20})["']/i,
+              /databaseVersion['":\s]*(\d{13,20})/i,
+              /currentDatabaseVersion['":\s]*(\d{13,20})/i,
+            ];
+            for (const pat of mcPatterns) {
+              const m = messengerCom.body.match(pat);
+              if (m) {
+                versionId = m[1];
+                results.versionFromMessengerCom = versionId;
+                break;
+              }
+            }
+            // Also look for the same string context search
+            const mcTerms = ['version_id', 'schemaVersion', 'databaseVersion', 'LSVersion'];
+            const mcContexts: Record<string, string> = {};
+            for (const term of mcTerms) {
+              const idx = messengerCom.body.indexOf(term);
+              if (idx !== -1) {
+                mcContexts[term] = messengerCom.body.substring(idx, idx + 120).replace(/[\n\r]/g, ' ');
+              }
+            }
+            if (Object.keys(mcContexts).length > 0) {
+              results.messengerComContexts = mcContexts;
+            }
+            results.messengerComPageLength = messengerCom.body.length;
+          } catch (error) {
+            results.messengerComError = error instanceof Error ? error.message : String(error);
+          }
+        }
       } catch (error) {
         results.bundleSearchError = error instanceof Error ? error.message : String(error);
       }
