@@ -370,31 +370,31 @@ export class E2EESignalClient {
       referer: 'https://www.facebook.com/',
     });
 
-    // Search the HTML for E2EE-related strings
-    const e2eeTerms = [
-      'e2ee', 'E2EE', 'encrypt', 'prekey', 'pre_key', 'PreKey',
-      'identity_key', 'identityKey', 'SignalProtocol', 'signal_protocol',
-      'key_exchange', 'keyExchange', 'e2ee_key', 'SecureMessage',
-      'encrypted_message', 'encryptedMessage',
-    ];
+    // Search HTML for E2EE sync params (e.g. e2ee sync group config)
+    const e2eeSyncMatch = messengerPage.body.match(/"e2ee"\s*:\s*"([^"]{0,200})"/);
+    info.e2eeSyncParams = e2eeSyncMatch ? e2eeSyncMatch[1] : null;
 
-    const htmlMatches: Record<string, string[]> = {};
-    for (const term of e2eeTerms) {
+    // Search for Armadillo/WA-related module names in the HTML
+    const armadilloTerms = ['WASendMsgUtil', 'WAGenerateAndUpload', 'WAGetIdentity', 'armadillo',
+      'Armadillo', 'secureMessage', 'SecureMessage', 'LSInsertE2EE', 'sendE2ee',
+      'e2ee_send', 'LSE2EE', 'E2EESend', 'insertSecureMessage', 'SecureSend'];
+    const armadilloMatches: Record<string, string[]> = {};
+    for (const term of armadilloTerms) {
       const contexts: string[] = [];
       let from = 0;
-      while (contexts.length < 3) {
+      while (contexts.length < 2) {
         const idx = messengerPage.body.indexOf(term, from);
         if (idx === -1) break;
-        const start = Math.max(0, idx - 60);
-        const end = Math.min(messengerPage.body.length, idx + term.length + 120);
+        const start = Math.max(0, idx - 40);
+        const end = Math.min(messengerPage.body.length, idx + term.length + 160);
         contexts.push(messengerPage.body.substring(start, end).replace(/[\n\r]/g, ' '));
         from = idx + term.length;
       }
-      if (contexts.length > 0) htmlMatches[term] = contexts;
+      if (contexts.length > 0) armadilloMatches[term] = contexts;
     }
-    info.htmlE2EEMatches = htmlMatches;
+    info.armadilloMatches = armadilloMatches;
 
-    // Search first few bundles for E2EE-related doc_ids and task labels
+    // Scan bundles for E2EE task/send-related code
     const scriptPattern = /<script[^>]+src="([^"]*rsrc\.php[^"]*)"[^>]*>/g;
     let sm;
     const bundleUrls: string[] = [];
@@ -402,8 +402,23 @@ export class E2EESignalClient {
       bundleUrls.push(sm[1]);
     }
 
-    const bundleE2EE: Record<string, string[]> = {};
-    for (let i = 0; i < Math.min(bundleUrls.length, 5); i++) {
+    // Deep-scan first 6 bundles for specific E2EE send patterns
+    const bundleFindings: Record<string, string[]> = {};
+    const deepTerms = [
+      'sendE2ee', 'E2EESend', 'e2ee_send', 'armadilloSend', 'secureSend',
+      'LSInsertSecure', 'insertSecureMessage', 'LSSendSecure',
+      'label:46', 'label:"46"', 'label:\'46\'',
+      'e2ee_message', 'encryptedPayload', 'ciphertext',
+      'MWE2EESendMessage', 'MAWSendSecure', 'sendSecure',
+      'ARMADILLO_DEFAULT_E2EE', 'default_e2ee',
+      'preKeyRequest', 'getPreKeyBundle', 'fetchPreKey',
+      'identityKeyStore', 'preKeyStore',
+      'LSGetE2EE', 'LSSetE2EE', 'LSUpdateE2EE',
+      'getE2eeThread', 'getSecureThread',
+      '/messaging/e2ee/', '/messaging/encrypt/',
+    ];
+
+    for (let i = 0; i < Math.min(bundleUrls.length, 6); i++) {
       try {
         const fullUrl = bundleUrls[i].startsWith('http') ? bundleUrls[i] : `https://static.xx.fbcdn.net${bundleUrls[i]}`;
         const bundle = await this.httpClient.request(fullUrl, {
@@ -411,22 +426,21 @@ export class E2EESignalClient {
         });
 
         const contexts: string[] = [];
-        // Look for e2ee in the context of tasks/labels
-        for (const term of ['e2ee', 'E2EE', 'encryptedMessage', 'preKeyBundle', 'identityKey']) {
+        for (const term of deepTerms) {
           let from = 0;
-          while (contexts.length < 10) {
+          while (contexts.length < 30) {
             const idx = bundle.body.indexOf(term, from);
             if (idx === -1) break;
             const start = Math.max(0, idx - 80);
-            const end = Math.min(bundle.body.length, idx + term.length + 120);
-            contexts.push(`[bundle${i}:${idx}] ${bundle.body.substring(start, end).replace(/[\n\r]/g, ' ')}`);
+            const end = Math.min(bundle.body.length, idx + term.length + 200);
+            contexts.push(`[b${i}:${idx}] ${bundle.body.substring(start, end).replace(/[\n\r]/g, ' ')}`);
             from = idx + term.length;
           }
         }
-        if (contexts.length > 0) bundleE2EE[`bundle_${i}`] = contexts;
+        if (contexts.length > 0) bundleFindings[`bundle_${i}`] = contexts;
       } catch { /* skip */ }
     }
-    info.bundleE2EE = bundleE2EE;
+    info.bundleFindings = bundleFindings;
 
     return info;
   }
