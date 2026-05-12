@@ -146,17 +146,15 @@ export class AutoMessage {
         const messengerPage = await this.httpClient.request('https://www.facebook.com/messages/', {
           referer: 'https://www.facebook.com/',
         });
-        // Search for version_id or schemaVersion in the SPA JavaScript
-        // The version_id is typically a large number (13-19 digits)
+        // Search for LS database schema version in the SPA
+        // It's typically a 16-19 digit number near specific keywords
         const versionPatterns = [
-          /version_id["']\s*:\s*["'](\d{10,20})["']/,
-          /schemaVersion["']\s*:\s*["'](\d{10,20})["']/,
-          /"lsVersion"\s*:\s*"(\d{10,20})"/,
-          /ls_version["']\s*:\s*["'](\d{10,20})["']/,
-          /syncParams[^}]*version["']\s*:\s*["'](\d+)["']/,
-          /"version"\s*:\s*"?(\d{13,20})"?/,
-          /LSVersion[^"]*"(\d{10,20})"/,
-          /currentVersion[^"]*"(\d{10,20})"/,
+          /["']schemaVersion["']\s*:\s*["']?(\d{13,20})["']?/i,
+          /["']version_id["']\s*:\s*["'](\d{13,20})["']/i,
+          /["']lsVersion["']\s*:\s*["'](\d{13,20})["']/i,
+          /syncParams[^}]*["']version["']\s*:\s*["']?(\d{13,20})["']?/i,
+          /databaseVersion['"]\s*:\s*['"]*(\d{13,20})/i,
+          /["']currentDatabaseVersion["']\s*:\s*(\d{13,20})/i,
         ];
         for (const pat of versionPatterns) {
           const m = messengerPage.body.match(pat);
@@ -166,40 +164,72 @@ export class AutoMessage {
             break;
           }
         }
-        // Broader search: find all contexts where "version" appears near large numbers
-        const contextSnippets: string[] = [];
-        // Look around every "version" occurrence
-        const versionIndex = messengerPage.body.indexOf('ersion');
-        const indices: number[] = [];
-        let searchFrom = 0;
-        while (indices.length < 20) {
-          const idx = messengerPage.body.indexOf('ersion', searchFrom);
-          if (idx === -1) break;
-          indices.push(idx);
-          searchFrom = idx + 6;
+        // Broader search: find all 16-digit numbers in the SPA (potential version IDs)
+        // that are NOT doc_ids (which we already know)
+        const allLargeNums = new Set<string>();
+        const numPattern = /[=:,\[]\s*"?(\d{16,19})"?/g;
+        let nm;
+        while ((nm = numPattern.exec(messengerPage.body)) !== null) {
+          allLargeNums.add(nm[1]);
+          if (allLargeNums.size >= 30) break;
         }
-        for (const idx of indices) {
-          const context = messengerPage.body.substring(Math.max(0, idx - 30), idx + 80);
-          // Check if there's a large number nearby
-          const numMatch = context.match(/(\d{10,20})/);
-          if (numMatch) {
-            contextSnippets.push(context.replace(/[\n\r]/g, ' ').substring(0, 100));
-          }
-        }
-        results.versionContexts = contextSnippets;
+        results.largeNumbers = Array.from(allLargeNums).slice(0, 30);
         results.messengerPageLength = messengerPage.body.length;
       } catch (error) {
         results.versionExtractError = error instanceof Error ? error.message : String(error);
       }
       results.versionId = versionId;
 
-      // Try sending with discovered version_id, and also with fallback version
+      // Step 1: Try a SYNC request (requestType=1) to get current database version
+      try {
+        const syncBody = new URLSearchParams({
+          fb_dtsg: fbDtsg,
+          jazoest,
+          lsd,
+          fb_api_caller_class: 'RelayModern',
+          fb_api_req_friendly_name: 'LSPlatformGraphQLLightspeedRequestQuery',
+          variables: JSON.stringify({
+            deviceId: `device_${myUserId}_${Date.now()}`,
+            requestId: 0,
+            requestPayload: JSON.stringify({
+              version_id: '0',
+              tasks: [],
+              epoch_id: Date.now(),
+            }),
+            requestType: 1,  // SYNC — not execute
+          }),
+          doc_id: LS_DOC_ID,
+          __a: '1',
+        }).toString();
+        const syncResp = await this.httpClient.post(
+          'https://www.facebook.com/api/graphql/',
+          syncBody,
+          { referer: 'https://www.facebook.com/messages/' },
+        );
+        const syncClean = syncResp.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
+        // Look for version numbers in the sync response
+        const syncVersionMatch = syncClean.match(/"?version"?\s*:\s*"?(\d{13,20})"?/);
+        if (syncVersionMatch) {
+          versionId = syncVersionMatch[1];
+          results.versionFromSync = versionId;
+        }
+        results['sync-request'] = {
+          statusCode: syncResp.statusCode,
+          bodyLength: syncResp.body.length,
+          snippet: syncClean.substring(0, 800),
+        };
+      } catch (error) {
+        results['sync-request'] = { error: error instanceof Error ? error.message : String(error) };
+      }
+
+      // Step 2: Try sending with best version_id + corrected payload
       const timestamp = Date.now();
-      const otid = `${timestamp}${Math.floor(Math.random() * 1000000000)}`;
-      const versionsToTry = [versionId];
-      if (versionId !== '9477666248971112') versionsToTry.push('9477666248971112');
+      const versionsToTry = versionId !== '0' ? [versionId] : ['9477666248971112'];
 
       for (const vid of versionsToTry) {
+        // Generate a proper otid (19-digit snowflake-like ID)
+        const otid = String(BigInt(timestamp) * BigInt(4294967296) + BigInt(Math.floor(Math.random() * 4294967296)));
+
         const gqlBody = new URLSearchParams({
           fb_dtsg: fbDtsg,
           jazoest,
@@ -214,11 +244,14 @@ export class AutoMessage {
               tasks: [{
                 label: '46',
                 payload: JSON.stringify({
-                  thread_id: recipientId,
-                  otid: `${timestamp}${Math.floor(Math.random() * 1000000000)}`,
-                  source: 0,
+                  thread_id: Number(recipientId),
+                  otid,
+                  source: 65537,  // 0x10001 = web source
                   send_type: 1,
+                  sync_group: 1,
                   text: 'Test Nachricht',
+                  initiating_source: 1,
+                  skip_url_preview_gen: 0,
                 }),
                 queue_name: recipientId,
                 task_id: 1,
