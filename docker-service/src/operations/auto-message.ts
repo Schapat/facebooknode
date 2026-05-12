@@ -370,14 +370,51 @@ export class AutoMessage {
         results['sync-request'] = { error: error instanceof Error ? error.message : String(error) };
       }
 
-      // Step 3: Try sending with best version_id + corrected payload
+      // Step 3: Try sending with correct version + multiple payload variations
       const timestamp = Date.now();
-      const versionsToTry = versionId !== '0' ? [versionId] : ['9477666248971112'];
+      const vid = versionId !== '0' ? versionId : '26586128724376559';
 
-      for (const vid of versionsToTry) {
-        // Generate a proper otid (19-digit snowflake-like ID)
-        const otid = String(BigInt(timestamp) * BigInt(4294967296) + BigInt(Math.floor(Math.random() * 4294967296)));
+      // Test multiple payload formats to find what works
+      const payloadVariations: Array<{name: string; payload: Record<string, unknown>}> = [
+        {
+          name: 'v1-numThreadId',
+          payload: {
+            thread_id: Number(recipientId),
+            otid: String(BigInt(timestamp) * BigInt(4294967296) + BigInt(Math.floor(Math.random() * 4294967296))),
+            source: 65537,
+            send_type: 1,
+            sync_group: 1,
+            text: 'Test Nachricht',
+            initiating_source: 1,
+            skip_url_preview_gen: 0,
+          },
+        },
+        {
+          name: 'v2-strThreadId',
+          payload: {
+            thread_id: recipientId,
+            otid: String(BigInt(timestamp + 1) * BigInt(4294967296) + BigInt(Math.floor(Math.random() * 4294967296))),
+            source: 65537,
+            send_type: 1,
+            sync_group: 1,
+            text: 'Test Nachricht v2',
+            initiating_source: 1,
+            skip_url_preview_gen: 0,
+          },
+        },
+        {
+          name: 'v3-minimal',
+          payload: {
+            thread_id: Number(recipientId),
+            otid: String(BigInt(timestamp + 2) * BigInt(4294967296) + BigInt(Math.floor(Math.random() * 4294967296))),
+            source: 0,
+            send_type: 1,
+            text: 'Test Nachricht v3',
+          },
+        },
+      ];
 
+      for (const variation of payloadVariations) {
         const gqlBody = new URLSearchParams({
           fb_dtsg: fbDtsg,
           jazoest,
@@ -391,17 +428,8 @@ export class AutoMessage {
               version_id: vid,
               tasks: [{
                 label: '46',
-                payload: JSON.stringify({
-                  thread_id: Number(recipientId),
-                  otid,
-                  source: 65537,  // 0x10001 = web source
-                  send_type: 1,
-                  sync_group: 1,
-                  text: 'Test Nachricht',
-                  initiating_source: 1,
-                  skip_url_preview_gen: 0,
-                }),
-                queue_name: recipientId,
+                payload: JSON.stringify(variation.payload),
+                queue_name: String(recipientId),
                 task_id: 1,
                 failure_count: null,
               }],
@@ -423,17 +451,18 @@ export class AutoMessage {
           const hasFailed = cleanBody.includes('markOptimisticMessageFailed');
           const hasSuccess = cleanBody.includes('replaceOptimisticMessage') || cleanBody.includes('insertMessage');
           const hasRefresh = cleanBody.includes('forceWebClientRefresh');
-          results[`send-v${vid.substring(0, 8)}`] = {
+          results[`send-${variation.name}`] = {
             versionId: vid,
             statusCode: gqlResp.statusCode,
-            bodyLength: gqlResp.body.length,
             hasFailed,
             hasSuccess,
             hasRefresh,
-            snippet: cleanBody.substring(0, 2000),
+            snippet: cleanBody.substring(0, 1500),
           };
+          // Stop if we got success
+          if (hasSuccess) break;
         } catch (error) {
-          results[`send-v${vid.substring(0, 8)}`] = { versionId: vid, error: error instanceof Error ? error.message : String(error) };
+          results[`send-${variation.name}`] = { error: error instanceof Error ? error.message : String(error) };
         }
       }
     }
