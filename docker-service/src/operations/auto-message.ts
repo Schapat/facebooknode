@@ -235,45 +235,43 @@ export class AutoMessage {
       }
       results.versionId = versionId;
 
-      // Step 1: Find LSVersion module + search data-sjs blocks + JS bundles
+      // Step 1: Find LSVersion value from preloaded sync response + JS bundles
       try {
-        // Strategy A: Search for LSVersion module definition in HTML
-        // Facebook defines modules with __d("LSVersion",[],function(a,b,c,d,e,f){e.exports="..."})
-        const lsVersionContexts: string[] = [];
-        let searchFrom = 0;
-        while (lsVersionContexts.length < 5) {
-          const idx = messengerBody.indexOf('LSVersion', searchFrom);
-          if (idx === -1) break;
-          const start = Math.max(0, idx - 30);
-          const end = Math.min(messengerBody.length, idx + 200);
-          lsVersionContexts.push(messengerBody.substring(start, end).replace(/[\n\r]/g, ' '));
-          searchFrom = idx + 9;
-        }
-        results.lsVersionContexts = lsVersionContexts;
-
-        // Also search for LSPlatformMessengerSyncParams (contains sync params module)
-        const syncParamIdx = messengerBody.indexOf('LSPlatformMessengerSyncParams');
-        if (syncParamIdx !== -1) {
-          results.syncParamsContext = messengerBody.substring(syncParamIdx, syncParamIdx + 300).replace(/[\n\r]/g, ' ');
-        }
-
-        // Strategy B: Parse data-sjs blocks - get the LS preloaded response (contains version)
-        const sjsBlocks: string[] = [];
+        // Strategy A: Get the preloaded LS sync response from data-sjs blocks
+        // This contains the ACTUAL server sync response with the version
         const sjsPattern = /<script[^>]+data-sjs[^>]*>([\s\S]*?)<\/script>/gi;
         let sjsMatch;
+        const preloaderResponses: string[] = [];
         while ((sjsMatch = sjsPattern.exec(messengerBody)) !== null) {
           const block = sjsMatch[1];
-          // Get the LS Lightspeed preloader result (this contains the initial sync data!)
-          if (block.includes('LSPlatformGraphQLLightspeedRequestQueryRelayPreloader')) {
-            // This block contains the preloaded sync response - get more of it
-            sjsBlocks.push(block.substring(0, 2000));
-          } else if (/LSVersion|lightspeed|syncParams/i.test(block)) {
-            sjsBlocks.push(block.substring(0, 500));
+          if (block.includes('RelayPrefetchedStreamCache') && block.includes('LSPlatformGraphQLLightspeedRequestQueryRelayPreloader')) {
+            // This block has the actual initial sync result - capture lots of it
+            preloaderResponses.push(block.substring(0, 5000));
           }
         }
-        results.sjsLsBlocks = sjsBlocks;
+        results.preloaderResponses = preloaderResponses.length;
 
-        // Strategy C: Search ALL JS bundles for LSVersion module definition
+        // Parse the preloader response to find the version
+        for (const resp of preloaderResponses) {
+          // The response contains a nested JSON payload like {"data":{"viewer":{"lightspeed_web_request":{"payload":"..."}}}}
+          // The payload field has the sync data with schema version
+          const payloadMatch = resp.match(/"payload"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+          if (payloadMatch) {
+            // Unescape the JSON payload string
+            const payloadStr = payloadMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+            results.preloaderPayloadSnippet = payloadStr.substring(0, 1000);
+            // Look for version in the payload
+            const verMatch = payloadStr.match(/version['":\s]*(\d{13,20})/i);
+            if (verMatch) {
+              versionId = verMatch[1];
+              results.versionFromPreloader = versionId;
+            }
+          } else {
+            results.preloaderSnippet = resp.substring(0, 2000);
+          }
+        }
+
+        // Strategy B: Search ALL bundles for __d("LSVersion",...) module definition
         const scriptPattern2 = /<script[^>]+src="([^"]*rsrc\.php[^"]*)"[^>]*>/g;
         let sm2;
         const bundleUrls: string[] = [];
@@ -282,60 +280,47 @@ export class AutoMessage {
         }
         results.totalBundles = bundleUrls.length;
 
-        const bundleResults: Array<{idx: number; size: number; found: string | null; lsVersionHit: string | null}> = [];
-        for (let i = 0; i < bundleUrls.length; i++) {
-          const url = bundleUrls[i];
-          try {
-            const fullUrl = url.startsWith('http') ? url : `https://static.xx.fbcdn.net${url}`;
-            const bundle = await this.httpClient.request(fullUrl, {
-              referer: 'https://www.facebook.com/messages/',
-            });
-            let foundVersion: string | null = null;
-            let lsVersionHit: string | null = null;
+        // Only search bundles if we haven't found the version from preloader
+        if (versionId === '0') {
+          const bundleResults: Array<{idx: number; size: number; hit: string | null}> = [];
+          for (let i = 0; i < bundleUrls.length; i++) {
+            const url = bundleUrls[i];
+            try {
+              const fullUrl = url.startsWith('http') ? url : `https://static.xx.fbcdn.net${url}`;
+              const bundle = await this.httpClient.request(fullUrl, {
+                referer: 'https://www.facebook.com/messages/',
+              });
 
-            // Primary: Search for LSVersion module definition
-            const lvIdx = bundle.body.indexOf('"LSVersion"');
-            if (lvIdx === -1) {
-              const lvIdx2 = bundle.body.indexOf("'LSVersion'");
-              if (lvIdx2 !== -1) {
-                lsVersionHit = bundle.body.substring(lvIdx2 - 20, lvIdx2 + 200).replace(/[\n\r]/g, ' ');
-              }
-            } else {
-              lsVersionHit = bundle.body.substring(Math.max(0, lvIdx - 20), lvIdx + 200).replace(/[\n\r]/g, ' ');
-            }
-
-            // Also try to extract the actual version number near LSVersion
-            if (lsVersionHit) {
-              const verMatch = lsVersionHit.match(/(\d{13,20})/);
-              if (verMatch) {
-                foundVersion = verMatch[1];
-                versionId = verMatch[1];
-              }
-            }
-
-            // Fallback: regex patterns
-            if (!foundVersion) {
-              const bundlePatterns = [
-                /["']LSVersion["'][^}]*?["'](\d{13,20})["']/,
-                /exports\s*=\s*["'](\d{13,20})["']/,
-              ];
-              for (const pat of bundlePatterns) {
-                const m = bundle.body.match(pat);
-                if (m) {
-                  foundVersion = m[1];
-                  versionId = m[1];
+              // Search for the __d("LSVersion",...) definition specifically
+              const defIdx = bundle.body.indexOf('__d("LSVersion"');
+              if (defIdx !== -1) {
+                const context = bundle.body.substring(defIdx, defIdx + 300);
+                bundleResults.push({ idx: i, size: bundle.body.length, hit: context });
+                // Extract the version number from the module body
+                const modMatch = context.match(/exports\s*=\s*["']?(\d{13,20})["']?/);
+                if (modMatch) {
+                  versionId = modMatch[1];
+                  results.versionFromBundle = versionId;
                   break;
                 }
               }
-            }
 
-            if (lsVersionHit || foundVersion) {
-              bundleResults.push({ idx: i, size: bundle.body.length, found: foundVersion, lsVersionHit });
-            }
-            if (foundVersion) break;
-          } catch { /* skip failed bundles */ }
+              // Also check for all occurrences of "LSVersion" and show each context
+              const allLvOccurrences: string[] = [];
+              let sFrom = 0;
+              while (allLvOccurrences.length < 5) {
+                const lvIdx = bundle.body.indexOf('"LSVersion"', sFrom);
+                if (lvIdx === -1) break;
+                allLvOccurrences.push(bundle.body.substring(Math.max(0, lvIdx - 50), lvIdx + 150).replace(/[\n\r]/g, ' '));
+                sFrom = lvIdx + 11;
+              }
+              if (allLvOccurrences.length > 0) {
+                bundleResults.push({ idx: i, size: bundle.body.length, hit: `${allLvOccurrences.length} occurrences: ${JSON.stringify(allLvOccurrences[0]).substring(0, 200)}` });
+              }
+            } catch { /* skip */ }
+          }
+          results.bundleSearch = bundleResults;
         }
-        results.bundleSearch = bundleResults;
       } catch (error) {
         results.bundleSearchError = error instanceof Error ? error.message : String(error);
       }
