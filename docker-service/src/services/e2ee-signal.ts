@@ -297,13 +297,21 @@ export class E2EESignalClient {
       return results;
     }
 
-    // Step 2: Discover LSVersion + E2EE endpoints
+    // Step 2: Discover LSVersion + scan for E2EE task info
     try {
       await this.discoverEndpoints();
-      results.endpoints = { lsVersion: this.lsVersion, e2eeKeyUpload: DOC_IDS.e2eeKeyUpload || 'not found', e2eeKeyFetch: DOC_IDS.e2eeKeyFetch || 'not found' };
+      results.endpoints = { lsVersion: this.lsVersion };
     } catch (error) {
       results.endpoints = { error: error instanceof Error ? error.message : String(error) };
       return results;
+    }
+
+    // Step 2b: Scan Messenger page and bundles for E2EE-related strings
+    try {
+      const e2eeInfo = await this.scanForE2EEInfo();
+      results.e2eeDiscovery = e2eeInfo;
+    } catch (error) {
+      results.e2eeDiscovery = { error: error instanceof Error ? error.message : String(error) };
     }
 
     // Step 3: Key generation
@@ -345,38 +353,82 @@ export class E2EESignalClient {
         signedPreKeyId: bundle.signedPreKey.keyId,
         hasPreKey: !!bundle.preKey,
       };
-
-      // Step 6: Establish session
-      try {
-        await this.establishSession(recipientId, bundle);
-        results.sessionEstablished = true;
-      } catch (error) {
-        results.sessionEstablished = { error: error instanceof Error ? error.message : String(error) };
-      }
-
-      // Step 7: Encrypt test message
-      try {
-        const encrypted = await this.encryptMessage(recipientId, 'E2EE test');
-        results.encryption = {
-          ciphertextLength: encrypted.length,
-          ciphertextPreview: encrypted.toString('base64').substring(0, 40) + '...',
-        };
-
-        // Step 8: Send
-        try {
-          const sendResult = await this.sendEncryptedMessage(recipientId, encrypted);
-          results.send = sendResult;
-        } catch (error) {
-          results.send = { error: error instanceof Error ? error.message : String(error) };
-        }
-      } catch (error) {
-        results.encryption = { error: error instanceof Error ? error.message : String(error) };
-      }
     } catch (error) {
       results.recipientBundle = { error: error instanceof Error ? error.message : String(error) };
     }
 
     return results;
+  }
+
+  /**
+   * Scan Messenger page and JS bundles for E2EE-related endpoint info.
+   */
+  private async scanForE2EEInfo(): Promise<Record<string, unknown>> {
+    const info: Record<string, unknown> = {};
+
+    const messengerPage = await this.httpClient.request('https://www.facebook.com/messages/', {
+      referer: 'https://www.facebook.com/',
+    });
+
+    // Search the HTML for E2EE-related strings
+    const e2eeTerms = [
+      'e2ee', 'E2EE', 'encrypt', 'prekey', 'pre_key', 'PreKey',
+      'identity_key', 'identityKey', 'SignalProtocol', 'signal_protocol',
+      'key_exchange', 'keyExchange', 'e2ee_key', 'SecureMessage',
+      'encrypted_message', 'encryptedMessage',
+    ];
+
+    const htmlMatches: Record<string, string[]> = {};
+    for (const term of e2eeTerms) {
+      const contexts: string[] = [];
+      let from = 0;
+      while (contexts.length < 3) {
+        const idx = messengerPage.body.indexOf(term, from);
+        if (idx === -1) break;
+        const start = Math.max(0, idx - 60);
+        const end = Math.min(messengerPage.body.length, idx + term.length + 120);
+        contexts.push(messengerPage.body.substring(start, end).replace(/[\n\r]/g, ' '));
+        from = idx + term.length;
+      }
+      if (contexts.length > 0) htmlMatches[term] = contexts;
+    }
+    info.htmlE2EEMatches = htmlMatches;
+
+    // Search first few bundles for E2EE-related doc_ids and task labels
+    const scriptPattern = /<script[^>]+src="([^"]*rsrc\.php[^"]*)"[^>]*>/g;
+    let sm;
+    const bundleUrls: string[] = [];
+    while ((sm = scriptPattern.exec(messengerPage.body)) !== null) {
+      bundleUrls.push(sm[1]);
+    }
+
+    const bundleE2EE: Record<string, string[]> = {};
+    for (let i = 0; i < Math.min(bundleUrls.length, 5); i++) {
+      try {
+        const fullUrl = bundleUrls[i].startsWith('http') ? bundleUrls[i] : `https://static.xx.fbcdn.net${bundleUrls[i]}`;
+        const bundle = await this.httpClient.request(fullUrl, {
+          referer: 'https://www.facebook.com/messages/',
+        });
+
+        const contexts: string[] = [];
+        // Look for e2ee in the context of tasks/labels
+        for (const term of ['e2ee', 'E2EE', 'encryptedMessage', 'preKeyBundle', 'identityKey']) {
+          let from = 0;
+          while (contexts.length < 10) {
+            const idx = bundle.body.indexOf(term, from);
+            if (idx === -1) break;
+            const start = Math.max(0, idx - 80);
+            const end = Math.min(bundle.body.length, idx + term.length + 120);
+            contexts.push(`[bundle${i}:${idx}] ${bundle.body.substring(start, end).replace(/[\n\r]/g, ' ')}`);
+            from = idx + term.length;
+          }
+        }
+        if (contexts.length > 0) bundleE2EE[`bundle_${i}`] = contexts;
+      } catch { /* skip */ }
+    }
+    info.bundleE2EE = bundleE2EE;
+
+    return info;
   }
 
   // ──────────────────────────────────────────────────────────────────
