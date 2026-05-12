@@ -165,7 +165,7 @@ export class MQTTMessenger {
       }, 10000);
 
       try {
-        this.ws = new WebSocket('wss://edge-chat.facebook.com/chat', {
+        this.ws = new WebSocket('wss://edge-chat.facebook.com/chat', ['chat'], {
           headers: {
             Origin: 'https://www.facebook.com',
             Cookie: cookies,
@@ -496,7 +496,7 @@ export class MQTTMessenger {
 
     // Compress the Thrift binary with zlib
     const thriftBuf = thrift.toBuffer();
-    const compressed = zlib.deflateSync(thriftBuf);
+    const compressed = zlib.deflateRawSync(thriftBuf);
 
     // Protocol name: "MQTToT"
     const protocolName = Buffer.from('MQTToT');
@@ -516,9 +516,11 @@ export class MQTTMessenger {
     // Variable header
     const variableHeader = Buffer.concat([protocolNameLen, protocolName, protocolLevel, connectFlags, keepAlive]);
 
-    // Client ID (empty string)
-    const clientId = Buffer.alloc(2);
-    clientId.writeUInt16BE(0, 0);
+    // Client ID (device UUID)
+    const clientIdStr = Buffer.from(this.deviceId, 'utf-8');
+    const clientIdLen = Buffer.alloc(2);
+    clientIdLen.writeUInt16BE(clientIdStr.length, 0);
+    const clientId = Buffer.concat([clientIdLen, clientIdStr]);
 
     // Username = compressed Thrift binary
     const usernameLen = Buffer.alloc(2);
