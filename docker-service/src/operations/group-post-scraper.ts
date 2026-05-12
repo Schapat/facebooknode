@@ -17,75 +17,46 @@ export class GroupPostScraper {
   async execute(sessionName: string, input: GroupPostScraperInput): Promise<GroupPost[]> {
     await this.httpClient.initSession(sessionName);
     const allPosts: GroupPost[] = [];
-    const errors: { groupUrl: string; error: string }[] = [];
+    let sessionExpired = false;
 
     try {
       for (let i = 0; i < input.groups.length; i++) {
         const groupUrl = input.groups[i];
-        log.info({ groupUrl, index: i + 1, total: input.groups.length }, 'Scraping group posts via HTTP');
+        const startTime = Date.now();
+        log.info({ groupUrl, index: i + 1, total: input.groups.length }, 'Scraping group');
         try {
-          const posts = await this.scrapeGroupWithRetry(groupUrl, input);
+          const posts = await this.scrapeGroup(groupUrl, input);
           allPosts.push(...posts);
-          log.info({ groupUrl, postsFound: posts.length }, 'Group scraped successfully');
+          const elapsed = Date.now() - startTime;
+          log.info({ groupUrl, postsFound: posts.length, elapsedMs: elapsed }, 'Group done');
         } catch (error) {
           const msg = error instanceof Error ? error.message : 'Unknown error';
-          log.error({ groupUrl, error: msg }, 'Failed to scrape group');
-          errors.push({ groupUrl, error: msg });
+          const isSessionIssue = msg.includes('login page') || msg.includes('checkpoint') || msg.includes('Session expired');
+
+          if (isSessionIssue) {
+            sessionExpired = true;
+            log.error({ groupUrl, error: msg, scrapedSoFar: allPosts.length }, 'Session expired or blocked - stopping scrape. Cookies need renewal.');
+            // Stop scraping remaining groups — all will fail with bad session
+            break;
+          }
+
+          log.error({ groupUrl, error: msg }, 'Failed to scrape group, skipping');
         }
-        // Delay between groups to avoid rate-limiting
+        // Delay between groups
         if (i < input.groups.length - 1) {
-          const baseDelay = input.groupDelay || 5000;
-          const jitter = Math.floor(Math.random() * 3000); // 0-3s random jitter
-          const delayMs = baseDelay + jitter;
-          log.info({ delayMs, nextGroup: input.groups[i + 1] }, 'Waiting before next group');
+          const delayMs = input.groupDelay || 5000;
           await new Promise(resolve => setTimeout(resolve, delayMs));
         }
       }
     } finally {
-      // Always persist rotated cookies back to Redis
       await this.httpClient.persistCookies();
     }
 
-    if (errors.length > 0) {
-      log.warn({
-        totalGroups: input.groups.length,
-        successfulGroups: input.groups.length - errors.length,
-        failedGroups: errors.length,
-        errors,
-      }, 'Some groups failed to scrape');
+    if (sessionExpired && allPosts.length === 0) {
+      throw new ScrapeError('Session expired or blocked by Facebook. Please update your cookies.');
     }
 
     return allPosts;
-  }
-
-  private async scrapeGroupWithRetry(
-    groupUrl: string,
-    input: GroupPostScraperInput,
-    maxRetries: number = 2,
-  ): Promise<GroupPost[]> {
-    let lastError: Error | null = null;
-
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      try {
-        return await this.scrapeGroup(groupUrl, input);
-      } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error));
-        const isRateLimit = lastError.message.includes('login page') ||
-          lastError.message.includes('checkpoint') ||
-          lastError.message.includes('Session expired');
-
-        if (isRateLimit && attempt < maxRetries) {
-          const backoffMs = (attempt + 1) * 10000; // 10s, 20s
-          log.warn({ groupUrl, attempt: attempt + 1, backoffMs }, 'Rate-limited, backing off before retry');
-          await new Promise(resolve => setTimeout(resolve, backoffMs));
-          continue;
-        }
-
-        throw lastError;
-      }
-    }
-
-    throw lastError!;
   }
 
   private async scrapeGroup(
