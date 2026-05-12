@@ -142,33 +142,78 @@ export class AutoMessage {
 
       // First: extract the real version_id from the Messenger SPA
       let versionId = '0';
+      let messengerBody = '';
       try {
         const messengerPage = await this.httpClient.request('https://www.facebook.com/messages/', {
           referer: 'https://www.facebook.com/',
         });
+        messengerBody = messengerPage.body;
+        results.messengerPageLength = messengerBody.length;
 
-        // Strategy 1: Search for LS database version in __d() module definitions
-        // Facebook SPA uses __d("ModuleName",...) to define JS modules
-        const lsModuleMatches: string[] = [];
-        const modulePattern = /__d\("([^"]*(?:LS|Lightspeed|lightspeed|Database)[^"]*)"/gi;
-        let mm;
-        while ((mm = modulePattern.exec(messengerPage.body)) !== null) {
-          lsModuleMatches.push(mm[1]);
-          if (lsModuleMatches.length >= 20) break;
+        // Strategy 1: Search for specific version-related strings and dump context
+        const searchTerms = [
+          'version_id',
+          'schemaVersion',
+          'databaseVersion',
+          'LSPlatformGraphQLLightspeedVariables',
+          'LightspeedConfig',
+          'syncVersion',
+          'DatabaseVersion',
+          'MqttWebConfig',
+          'ls_version',
+          'MercuryConfig',
+        ];
+        const stringContexts: Record<string, string[]> = {};
+        for (const term of searchTerms) {
+          const contexts: string[] = [];
+          let searchFrom = 0;
+          while (contexts.length < 3) {
+            const idx = messengerBody.indexOf(term, searchFrom);
+            if (idx === -1) break;
+            const start = Math.max(0, idx - 40);
+            const end = Math.min(messengerBody.length, idx + term.length + 160);
+            contexts.push(messengerBody.substring(start, end).replace(/[\n\r]/g, ' '));
+            searchFrom = idx + term.length;
+          }
+          if (contexts.length > 0) {
+            stringContexts[term] = contexts;
+          }
         }
-        results.lsModules = lsModuleMatches;
+        results.stringContexts = stringContexts;
 
-        // Strategy 2: Search for known version-related patterns
+        // Strategy 2: Find script bundle URLs for external JS
+        const scriptUrls: string[] = [];
+        const scriptPattern = /<script[^>]+src="([^"]*rsrc\.php[^"]*)"[^>]*>/g;
+        let sm;
+        while ((sm = scriptPattern.exec(messengerBody)) !== null) {
+          scriptUrls.push(sm[1]);
+          if (scriptUrls.length >= 30) break;
+        }
+        results.scriptBundleCount = scriptUrls.length;
+        // Show first 5 URLs for reference
+        results.scriptBundleSamples = scriptUrls.slice(0, 5);
+
+        // Strategy 3: Search for version in ScheduledServerJS handle calls
+        // These embed config data in the HTML
+        const handlePattern = /handle\(\{[^}]*(?:Lightspeed|LS(?:Platform|Config)|Mercury|version)[^}]{0,500}\}/gi;
+        const handleMatches: string[] = [];
+        let hm;
+        while ((hm = handlePattern.exec(messengerBody)) !== null) {
+          handleMatches.push(hm[0].substring(0, 300));
+          if (handleMatches.length >= 5) break;
+        }
+        results.handleMatches = handleMatches;
+
+        // Strategy 4: Known version patterns
         const versionPatterns = [
           /["']schemaVersion["']\s*:\s*["']?(\d{13,20})["']?/i,
           /["']version_id["']\s*:\s*["'](\d{13,20})["']/i,
           /["']lsVersion["']\s*:\s*["'](\d{13,20})["']/i,
           /databaseVersion['"]\s*:\s*['"]*(\d{13,20})/i,
           /["']currentDatabaseVersion["']\s*:\s*(\d{13,20})/i,
-          /sp_(?:version|ver|v)\s*[:=]\s*["']?(\d{13,20})["']?/i,
         ];
         for (const pat of versionPatterns) {
-          const m = messengerPage.body.match(pat);
+          const m = messengerBody.match(pat);
           if (m) {
             versionId = m[1];
             results.versionIdSource = pat.source.substring(0, 40);
@@ -176,38 +221,70 @@ export class AutoMessage {
           }
         }
 
-        // Strategy 3: Look for contexts around "database", "schema", "LS" with large numbers
-        const contextKeywords = ['DatabaseVersion', 'SchemaVersion', 'LSVersion', 'ls_version', 'spVersion', 'syncVersion'];
-        const keywordContexts: Record<string, string> = {};
-        for (const kw of contextKeywords) {
-          const idx = messengerPage.body.indexOf(kw);
-          if (idx !== -1) {
-            keywordContexts[kw] = messengerPage.body.substring(idx, idx + 120).replace(/[\n\r]/g, ' ');
-          }
-        }
-        // Also look for "version" near "lightspeed" or "LS"
-        const lsIdx = messengerPage.body.indexOf('"LSPlatform');
-        if (lsIdx !== -1) {
-          keywordContexts['LSPlatform'] = messengerPage.body.substring(lsIdx, lsIdx + 200).replace(/[\n\r]/g, ' ');
-        }
-        results.keywordContexts = keywordContexts;
-
-        // Strategy 4: Extract all 16-19 digit numbers
+        // Strategy 5: Extract ALL 16-19 digit numbers (up to 50)
         const allLargeNums = new Set<string>();
         const numPattern = /[=:,\[]\s*"?(\d{16,19})"?/g;
         let nm;
-        while ((nm = numPattern.exec(messengerPage.body)) !== null) {
+        while ((nm = numPattern.exec(messengerBody)) !== null) {
           allLargeNums.add(nm[1]);
           if (allLargeNums.size >= 50) break;
         }
         results.largeNumbers = Array.from(allLargeNums).slice(0, 50);
-        results.messengerPageLength = messengerPage.body.length;
       } catch (error) {
         results.versionExtractError = error instanceof Error ? error.message : String(error);
       }
       results.versionId = versionId;
 
-      // Step 1: Try a SYNC request (requestType=1) with known version to get current version
+      // Step 1: Try loading one JS bundle to find the LS version
+      try {
+        // Look for script bundles containing "Lightspeed" or "LSPlatform" config
+        const scriptPattern = /<script[^>]+src="([^"]*rsrc\.php[^"]*)"[^>]*>/g;
+        let sm;
+        const bundleUrls: string[] = [];
+        while ((sm = scriptPattern.exec(messengerBody)) !== null) {
+          bundleUrls.push(sm[1]);
+        }
+        results.totalBundles = bundleUrls.length;
+        
+        // Load the first 3 bundles and search for version patterns
+        const bundleResults: Array<{url: string; size: number; found: string | null}> = [];
+        for (const url of bundleUrls.slice(0, 3)) {
+          try {
+            const fullUrl = url.startsWith('http') ? url : `https://static.xx.fbcdn.net${url}`;
+            const bundle = await this.httpClient.request(fullUrl, {
+              referer: 'https://www.facebook.com/messages/',
+            });
+            let foundVersion: string | null = null;
+            // Search for version patterns in JS bundle
+            const bundlePatterns = [
+              /LSPlatformDatabaseVersion[^;]*?["'](\d{13,20})["']/,
+              /databaseVersion['":\s]*(\d{13,20})/,
+              /schemaVersion['":\s]*(\d{13,20})/,
+              /version_id['":\s]*["']?(\d{13,20})["']?/,
+              /ls_version['":\s]*(\d{13,20})/,
+            ];
+            for (const pat of bundlePatterns) {
+              const m = bundle.body.match(pat);
+              if (m) {
+                foundVersion = m[1];
+                versionId = m[1];
+                break;
+              }
+            }
+            bundleResults.push({
+              url: url.substring(url.length - 40),
+              size: bundle.body.length,
+              found: foundVersion,
+            });
+            if (foundVersion) break;
+          } catch { /* skip failed bundles */ }
+        }
+        results.bundleSearch = bundleResults;
+      } catch (error) {
+        results.bundleSearchError = error instanceof Error ? error.message : String(error);
+      }
+
+      // Step 2: Try a SYNC request (requestType=1)
       try {
         const syncBody = new URLSearchParams({
           fb_dtsg: fbDtsg,
@@ -252,7 +329,7 @@ export class AutoMessage {
         results['sync-request'] = { error: error instanceof Error ? error.message : String(error) };
       }
 
-      // Step 2: Try sending with best version_id + corrected payload
+      // Step 3: Try sending with best version_id + corrected payload
       const timestamp = Date.now();
       const versionsToTry = versionId !== '0' ? [versionId] : ['9477666248971112'];
 
