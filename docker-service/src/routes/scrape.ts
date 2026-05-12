@@ -193,17 +193,23 @@ export function registerScrapeRoutes(
             })(),
             groupIdMatch: (() => {
               const patterns = [
-                /"groupID"\s*:\s*"(\d+)"/,
-                /"group_id"\s*:\s*"(\d+)"/,
-                /group\/(\d+)/,
-                /fb:\/\/group\/(\d+)/,
-                /entity_id\s*:\s*"(\d+)"/,
+                { re: /"groupID"\s*:\s*"(\d+)"/, label: 'groupID' },
+                { re: /"group_id"\s*:\s*"(\d+)"/, label: 'group_id' },
+                { re: /group\/(\d+)/, label: 'group/NNN' },
+                { re: /fb:\/\/group\/(\d+)/, label: 'fb://group' },
+                { re: /entity_id\s*:\s*"(\d+)"/, label: 'entity_id' },
+                { re: /"groupID":"(\d+)"/, label: 'groupID-nospace' },
+                { re: /groups\/(\d+)/, label: 'groups/NNN' },
+                { re: /"targetGroupID"\s*:\s*"(\d+)"/, label: 'targetGroupID' },
+                { re: /"__isGroupMember":"Group"[^}]*"id":"(\d+)"/, label: 'isGroupMember' },
+                { re: /"Group","id":"(\d+)"/, label: 'Group-id' },
               ];
-              for (const p of patterns) {
-                const m = response.body.match(p);
-                if (m) return { id: m[1], pattern: p.source.substring(0, 30) };
+              const results: { id: string; pattern: string }[] = [];
+              for (const { re, label } of patterns) {
+                const m = response.body.match(re);
+                if (m) results.push({ id: m[1], pattern: label });
               }
-              return null;
+              return results.length > 0 ? results : null;
             })(),
             hasEndCursor: !!(response.body.match(/"end_cursor"\s*:\s*"([^"]{10,})"/)),
           },
