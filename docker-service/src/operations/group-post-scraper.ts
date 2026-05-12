@@ -17,18 +17,25 @@ export class GroupPostScraper {
   async execute(sessionName: string, input: GroupPostScraperInput): Promise<GroupPost[]> {
     await this.httpClient.initSession(sessionName);
     const allPosts: GroupPost[] = [];
+    const errors: { groupUrl: string; error: string }[] = [];
 
     try {
-      for (const groupUrl of input.groups) {
-        log.info({ groupUrl }, 'Scraping group posts via HTTP');
+      for (let i = 0; i < input.groups.length; i++) {
+        const groupUrl = input.groups[i];
+        log.info({ groupUrl, index: i + 1, total: input.groups.length }, 'Scraping group posts via HTTP');
         try {
-          const posts = await this.scrapeGroup(groupUrl, input);
+          const posts = await this.scrapeGroupWithRetry(groupUrl, input);
           allPosts.push(...posts);
+          log.info({ groupUrl, postsFound: posts.length }, 'Group scraped successfully');
         } catch (error) {
-          log.error({ groupUrl, error }, 'Failed to scrape group');
+          const msg = error instanceof Error ? error.message : 'Unknown error';
+          log.error({ groupUrl, error: msg }, 'Failed to scrape group');
+          errors.push({ groupUrl, error: msg });
         }
-        if (input.groups.indexOf(groupUrl) < input.groups.length - 1) {
-          await randomDelay(2000, 5000);
+        // Delay between groups to avoid rate-limiting
+        if (i < input.groups.length - 1) {
+          const delay = input.groups.length > 5 ? randomDelay(5000, 10000) : randomDelay(3000, 6000);
+          await delay;
         }
       }
     } finally {
@@ -36,7 +43,46 @@ export class GroupPostScraper {
       await this.httpClient.persistCookies();
     }
 
+    if (errors.length > 0) {
+      log.warn({
+        totalGroups: input.groups.length,
+        successfulGroups: input.groups.length - errors.length,
+        failedGroups: errors.length,
+        errors,
+      }, 'Some groups failed to scrape');
+    }
+
     return allPosts;
+  }
+
+  private async scrapeGroupWithRetry(
+    groupUrl: string,
+    input: GroupPostScraperInput,
+    maxRetries: number = 2,
+  ): Promise<GroupPost[]> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await this.scrapeGroup(groupUrl, input);
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        const isRateLimit = lastError.message.includes('login page') ||
+          lastError.message.includes('checkpoint') ||
+          lastError.message.includes('Session expired');
+
+        if (isRateLimit && attempt < maxRetries) {
+          const backoffMs = (attempt + 1) * 15000; // 15s, 30s
+          log.warn({ groupUrl, attempt: attempt + 1, backoffMs }, 'Rate-limited, backing off before retry');
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
+          continue;
+        }
+
+        throw lastError;
+      }
+    }
+
+    throw lastError!;
   }
 
   private async scrapeGroup(

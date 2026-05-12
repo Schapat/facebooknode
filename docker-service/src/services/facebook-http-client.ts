@@ -449,11 +449,24 @@ export class FacebookHttpClient {
   }
 
   isLoginPage(html: string): boolean {
-    return (
+    // Direct login page indicators
+    if (
       html.includes('login_form') ||
       html.includes('action="/login') ||
-      html.includes('"loggedIn":false') ||
-      (html.includes('checkpoint') && html.length < 5000)
-    );
+      html.includes('"loggedIn":false')
+    ) {
+      return true;
+    }
+
+    // Checkpoint / security check pages (can be any size)
+    if (
+      (html.includes('checkpoint') || html.includes('security_check')) &&
+      !html.includes('post_id') &&
+      !html.includes('creation_time')
+    ) {
+      return true;
+    }
+
+    return false;
   }
 }
