@@ -372,47 +372,39 @@ export class AutoMessage {
         results['sync-request'] = { error: error instanceof Error ? error.message : String(error) };
       }
 
-      // Step 3: Try sending with correct version — same deviceId as sync
+      // Step 3: Try sending — test self vs recipient, different formats
       const timestamp = Date.now();
       const vid = versionId !== '0' ? versionId : '26586128724376559';
       const deviceId = `device_${myUserId}_0`;  // Same as sync
 
-      // Test multiple payload formats to find what works
+      // Test variations: send to self + send to recipient + different formats
       const payloadVariations: Array<{name: string; payload: Record<string, unknown>}> = [
         {
-          name: 'v1-numThreadId',
+          // Send to SELF — if self-chat is not E2EE, this might work
+          name: 'self-send',
+          payload: {
+            thread_id: Number(myUserId),
+            otid: String(BigInt(timestamp) * BigInt(4294967296) + BigInt(Math.floor(Math.random() * 4294967296))),
+            source: 65537,
+            send_type: 1,
+            sync_group: 1,
+            text: 'Self test message',
+            initiating_source: 1,
+            skip_url_preview_gen: 0,
+          },
+        },
+        {
+          // Standard send to recipient
+          name: 'recipient-send',
           payload: {
             thread_id: Number(recipientId),
-            otid: String(BigInt(timestamp) * BigInt(4294967296) + BigInt(Math.floor(Math.random() * 4294967296))),
+            otid: String(BigInt(timestamp + 1) * BigInt(4294967296) + BigInt(Math.floor(Math.random() * 4294967296))),
             source: 65537,
             send_type: 1,
             sync_group: 1,
             text: 'Test Nachricht',
             initiating_source: 1,
             skip_url_preview_gen: 0,
-          },
-        },
-        {
-          name: 'v2-strThreadId',
-          payload: {
-            thread_id: recipientId,
-            otid: String(BigInt(timestamp + 1) * BigInt(4294967296) + BigInt(Math.floor(Math.random() * 4294967296))),
-            source: 65537,
-            send_type: 1,
-            sync_group: 1,
-            text: 'Test Nachricht v2',
-            initiating_source: 1,
-            skip_url_preview_gen: 0,
-          },
-        },
-        {
-          name: 'v3-minimal',
-          payload: {
-            thread_id: Number(recipientId),
-            otid: String(BigInt(timestamp + 2) * BigInt(4294967296) + BigInt(Math.floor(Math.random() * 4294967296))),
-            source: 0,
-            send_type: 1,
-            text: 'Test Nachricht v3',
           },
         },
       ];
@@ -432,7 +424,7 @@ export class AutoMessage {
               tasks: [{
                 label: '46',
                 payload: JSON.stringify(variation.payload),
-                queue_name: String(recipientId),
+                queue_name: String(variation.payload.thread_id),
                 task_id: 1,
                 failure_count: null,
               }],
@@ -454,13 +446,15 @@ export class AutoMessage {
           const hasFailed = cleanBody.includes('markOptimisticMessageFailed');
           const hasSuccess = cleanBody.includes('replaceOptimisticMessage') || cleanBody.includes('insertMessage');
           const hasRefresh = cleanBody.includes('forceWebClientRefresh');
+          const hasE2EE = cleanBody.includes('e2ee') || cleanBody.includes('E2EE') || cleanBody.includes('encrypt');
           results[`send-${variation.name}`] = {
             versionId: vid,
             statusCode: gqlResp.statusCode,
             hasFailed,
             hasSuccess,
             hasRefresh,
-            snippet: cleanBody.substring(0, 1500),
+            hasE2EE,
+            snippet: cleanBody.substring(0, 3000),
           };
           // Stop if we got success
           if (hasSuccess) break;
