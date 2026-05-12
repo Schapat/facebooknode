@@ -181,29 +181,44 @@ export class AutoMessage {
         results['docIdSearch'] = { error: error instanceof Error ? error.message : String(error) };
       }
 
-      // 4b. Try known GraphQL doc_ids for message sending
-      const knownDocIds: Record<string, string> = {
-        'LSPlatformGraphQLLightspeedRequestQuery': '9661553617234498',
-        'SendMessageMutation': '7005893949479032',
-        'useSendMessageMutation_v2': '6939660172744766',
-        'CometMessageComposerMutation': '8610923455643158',
-        'LSGraphQLRequest': '8017539361632270',
-      };
+      // 4b. Try ALL extracted doc_ids from the Messenger SPA
+      // Remove the hardcoded known IDs — they're all outdated
+      // Instead, probe each extracted doc_id to find valid ones
+      const docIdsToTry = results['docIdSearch'] 
+        ? (results['docIdSearch'] as Record<string, unknown>).firstFewDocIds as string[] || []
+        : [];
 
-      for (const [name, docId] of Object.entries(knownDocIds)) {
+      const validDocIds: Array<{ docId: string; snippet: string }> = [];
+      for (const docId of docIdsToTry) {
         try {
+          // Use LSPlatform task format — this is how Messenger sends messages
           const gqlBody = new URLSearchParams({
             fb_dtsg: fbDtsg,
             jazoest,
             lsd,
             fb_api_caller_class: 'RelayModern',
-            fb_api_req_friendly_name: name,
+            fb_api_req_friendly_name: 'LSPlatformGraphQLLightspeedRequestQuery',
             variables: JSON.stringify({
-              input: {
-                otherUserFBID: recipientId,
-                message: { text: '' },
-                source: 'messenger:web',
-              },
+              deviceId: 'device_id_' + Date.now(),
+              requestId: 0,
+              requestPayload: JSON.stringify({
+                version_id: '0',
+                tasks: [{
+                  label: '46',
+                  payload: JSON.stringify({
+                    thread_id: recipientId,
+                    otid: String(Date.now()) + ':' + Math.floor(Math.random() * 1000000000),
+                    source: 0,
+                    send_type: 1,
+                    text: '',
+                  }),
+                  queue_name: recipientId,
+                  task_id: 1,
+                  failure_count: null,
+                }],
+                epoch_id: Date.now(),
+              }),
+              requestType: 3,
             }),
             doc_id: docId,
             __a: '1',
@@ -215,18 +230,14 @@ export class AutoMessage {
             { referer: 'https://www.facebook.com/messages/' },
           );
           const cleanBody = gqlResp.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
-          const isNotFound = cleanBody.includes('1357031') || cleanBody.includes('was not found');
-          results[`graphql-${name}`] = {
-            docId,
-            statusCode: gqlResp.statusCode,
-            bodyLength: gqlResp.body.length,
-            isNotFound,
-            snippet: cleanBody.substring(0, 500),
-          };
-        } catch (error) {
-          results[`graphql-${name}`] = { docId, error: error instanceof Error ? error.message : String(error) };
-        }
+          const isNotFound = cleanBody.includes('was not found');
+          if (!isNotFound) {
+            validDocIds.push({ docId, snippet: cleanBody.substring(0, 300) });
+          }
+        } catch { /* skip */ }
       }
+
+      results['validDocIds'] = validDocIds;
     }
 
     results.fbDtsgFound = !!fbDtsg;
