@@ -182,6 +182,30 @@ export function registerScrapeRoutes(
             hasPrivateGroup,
             textSnippet,
             cookieDebug: httpClient.getCookieDebugInfo(),
+            tokens: (() => {
+              const t = httpClient.extractTokens(response.body);
+              return {
+                hasFbDtsg: !!t.fbDtsg,
+                fbDtsgPrefix: t.fbDtsg ? t.fbDtsg.substring(0, 15) + '...' : null,
+                hasJazoest: !!t.jazoest,
+                hasLsd: !!t.lsd,
+              };
+            })(),
+            groupIdMatch: (() => {
+              const patterns = [
+                /"groupID"\s*:\s*"(\d+)"/,
+                /"group_id"\s*:\s*"(\d+)"/,
+                /group\/(\d+)/,
+                /fb:\/\/group\/(\d+)/,
+                /entity_id\s*:\s*"(\d+)"/,
+              ];
+              for (const p of patterns) {
+                const m = response.body.match(p);
+                if (m) return { id: m[1], pattern: p.source.substring(0, 30) };
+              }
+              return null;
+            })(),
+            hasEndCursor: !!(response.body.match(/"end_cursor"\s*:\s*"([^"]{10,})"/)),
           },
           timestamp: new Date().toISOString(),
         });

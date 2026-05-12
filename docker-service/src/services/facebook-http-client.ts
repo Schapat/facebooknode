@@ -449,17 +449,25 @@ export class FacebookHttpClient {
   }
 
   isLoginPage(html: string): boolean {
-    // Direct login page indicators
-    if (
-      html.includes('login_form') ||
-      html.includes('action="/login') ||
-      html.includes('"loggedIn":false')
-    ) {
+    // For large SPA responses (> 100KB), Facebook returned the full app shell.
+    // These always contain 'checkpoint'/'security_check' as JS code references,
+    // so we must NOT use those as login-page indicators on large pages.
+    const isLargeSPA = html.length > 100_000;
+
+    // Direct login page indicators (work for any size)
+    if (html.includes('login_form') || html.includes('action="/login')) {
       return true;
     }
 
-    // Checkpoint / security check pages (can be any size)
+    // "loggedIn":false — only trust on small pages; the SPA shell doesn't
+    // include this in the app JS bundles.
+    if (html.includes('"loggedIn":false')) {
+      return true;
+    }
+
+    // Small pages with checkpoint/security_check are real blocks
     if (
+      !isLargeSPA &&
       (html.includes('checkpoint') || html.includes('security_check')) &&
       !html.includes('post_id') &&
       !html.includes('creation_time')
