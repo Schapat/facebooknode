@@ -88,7 +88,7 @@ export class QueueManager {
     const job = await this.queue.add(jobData.operationType, jobData, {
       priority: jobData.priority || 0,
       delay: jobData.delay || 0,
-      attempts: jobData.retries || 3,
+      attempts: 1,
       backoff: {
         type: 'exponential',
         delay: 5000,

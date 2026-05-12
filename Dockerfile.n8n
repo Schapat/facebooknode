@@ -26,19 +26,19 @@ FROM n8nio/n8n:2.10.4
 
 USER root
 
-# Create custom node directory
-RUN mkdir -p /home/node/.n8n/nodes/n8n-nodes-facebook-automation/node_modules/@facebook-automation/shared-types
+# Create custom node directory (n8n loads from custom-nodes/)
+RUN mkdir -p /home/node/.n8n/custom-nodes/n8n-nodes-facebook-automation/node_modules/@facebook-automation/shared-types
 
 # Copy built shared-types
-COPY --from=builder /build/shared-types/dist /home/node/.n8n/nodes/n8n-nodes-facebook-automation/node_modules/@facebook-automation/shared-types/dist
-COPY --from=builder /build/shared-types/package.json /home/node/.n8n/nodes/n8n-nodes-facebook-automation/node_modules/@facebook-automation/shared-types/
+COPY --from=builder /build/shared-types/dist /home/node/.n8n/custom-nodes/n8n-nodes-facebook-automation/node_modules/@facebook-automation/shared-types/dist
+COPY --from=builder /build/shared-types/package.json /home/node/.n8n/custom-nodes/n8n-nodes-facebook-automation/node_modules/@facebook-automation/shared-types/
 
 # Copy built n8n-node
-COPY --from=builder /build/n8n-node/dist /home/node/.n8n/nodes/n8n-nodes-facebook-automation/dist
-COPY --from=builder /build/n8n-node/package.json /home/node/.n8n/nodes/n8n-nodes-facebook-automation/
+COPY --from=builder /build/n8n-node/dist /home/node/.n8n/custom-nodes/n8n-nodes-facebook-automation/dist
+COPY --from=builder /build/n8n-node/package.json /home/node/.n8n/custom-nodes/n8n-nodes-facebook-automation/
 
 # Fix ownership
-RUN chown -R node:node /home/node/.n8n/nodes
+RUN chown -R node:node /home/node/.n8n/custom-nodes
 
 USER node
 WORKDIR /home/node
