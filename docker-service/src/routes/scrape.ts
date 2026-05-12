@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { SessionManager } from '../services/session-manager';
 import type { QueueManager } from '../queue/queue-manager';
+import { FacebookHttpClient } from '../services/facebook-http-client';
 import { createChildLogger } from '../utils/logger';
 
 const log = createChildLogger({ service: 'ScrapeRoutes' });
@@ -26,6 +27,7 @@ const memberScraperSchema = z.object({
 export function registerScrapeRoutes(
   app: FastifyInstance,
   queueManager: QueueManager,
+  sessionManager: SessionManager,
 ): void {
   app.post('/scrape/posts', {
     schema: {
@@ -102,6 +104,92 @@ export function registerScrapeRoutes(
         jobId,
         timestamp: new Date().toISOString(),
       });
+    },
+  });
+
+  // ── Diagnose ──────────────────────────────────────────────────
+  app.post('/scrape/diagnose', {
+    schema: {
+      description: 'Diagnose scraping: check what Facebook returns for a group URL',
+      tags: ['Scrape'],
+    },
+    handler: async (request, reply) => {
+      const body = request.body as { sessionName: string; groupUrl: string };
+      if (!body.sessionName || !body.groupUrl) {
+        return reply.status(400).send({ error: 'sessionName and groupUrl required' });
+      }
+
+      const httpClient = new FacebookHttpClient(sessionManager);
+      await httpClient.initSession(body.sessionName);
+
+      try {
+        let groupUrl = body.groupUrl.trim();
+        if (!groupUrl.startsWith('http')) {
+          groupUrl = `https://www.facebook.com/groups/${groupUrl}`;
+        }
+
+        const response = await httpClient.request(groupUrl);
+        const isLogin = httpClient.isLoginPage(response.body);
+        const titleMatch = response.body.match(/<title>([^<]*)<\/title>/i);
+        const hasPostId = response.body.includes('post_id');
+        const hasStoryId = response.body.includes('story_id');
+        const hasCreationTime = response.body.includes('creation_time');
+        const hasPermalink = response.body.includes('/permalink/');
+        const scriptCount = (response.body.match(/<script/gi) || []).length;
+        const bodyLen = response.body.length;
+
+        // Check for common blocking indicators
+        const hasCheckpoint = response.body.includes('checkpoint');
+        const hasSecurityCheck = response.body.includes('security_check') || response.body.includes('captcha');
+        const hasContentNotAvailable = response.body.includes('content isn\'t available') || response.body.includes('not available');
+        const hasPrivateGroup = response.body.includes('private group') || response.body.includes('Join Group');
+        
+        // Extract a text snippet from the body
+        const textSnippet = response.body
+          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .substring(0, 500);
+
+        // Count JSON data blocks
+        const sjsBlocks = (response.body.match(/data-sjs/gi) || []).length;
+        const requireBlocks = (response.body.match(/__require\(/gi) || []).length;
+
+        await httpClient.persistCookies();
+
+        return reply.status(200).send({
+          success: true,
+          data: {
+            statusCode: response.statusCode,
+            bodyLength: bodyLen,
+            title: titleMatch?.[1] || null,
+            isLoginPage: isLogin,
+            hasPostId,
+            hasStoryId,
+            hasCreationTime,
+            hasPermalink,
+            scriptCount,
+            sjsBlocks,
+            requireBlocks,
+            hasCheckpoint,
+            hasSecurityCheck,
+            hasContentNotAvailable,
+            hasPrivateGroup,
+            textSnippet,
+            cookieDebug: httpClient.getCookieDebugInfo(),
+          },
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        await httpClient.persistCookies();
+        return reply.status(500).send({
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error',
+          timestamp: new Date().toISOString(),
+        });
+      }
     },
   });
 }

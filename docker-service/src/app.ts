@@ -148,7 +148,7 @@ export async function createApp(deps: AppDependencies): Promise<FastifyInstance>
       protectedApp.addHook('onRequest', authMiddleware);
 
       registerSessionRoutes(protectedApp, deps.sessionManager);
-      registerScrapeRoutes(protectedApp, deps.queueManager);
+      registerScrapeRoutes(protectedApp, deps.queueManager, deps.sessionManager);
       registerJobRoutes(protectedApp, deps.queueManager);
     },
     { prefix: '/api' },
