@@ -49,14 +49,17 @@ export class AutoMessage {
       });
       const dtsgMatch = home.body.match(/name="fb_dtsg"\s+value="([^"]+)"/);
       const jazoestMatch = home.body.match(/name="jazoest"\s+value="(\d+)"/);
+      // Also try SPA-style token extraction
+      const spaTokens = this.httpClient.extractTokens(home.body);
       results['mbasic-home'] = {
         statusCode: home.statusCode,
         bodyLength: home.body.length,
         isLoginPage: this.httpClient.isLoginPage(home.body),
-        hasFbDtsg: !!dtsgMatch,
-        fbDtsg: dtsgMatch ? dtsgMatch[1].substring(0, 20) + '...' : null,
-        jazoest: jazoestMatch ? jazoestMatch[1] : null,
+        hasFbDtsg: !!(dtsgMatch || spaTokens.fbDtsg),
+        fbDtsg: dtsgMatch ? dtsgMatch[1].substring(0, 20) + '...' : (spaTokens.fbDtsg ? spaTokens.fbDtsg.substring(0, 20) + '...' : null),
+        jazoest: jazoestMatch ? jazoestMatch[1] : spaTokens.jazoest || null,
         hasUnsupported: home.body.includes('unsupported-interstitial'),
+        isSPA: home.body.length > 500000,
       };
     } catch (error) {
       results['mbasic-home'] = { error: error instanceof Error ? error.message : String(error) };
@@ -108,36 +111,34 @@ export class AutoMessage {
     }
 
     // 4. Try direct POST to known send endpoints (blind send, no form scraping)
-    // Get tokens first from mbasic homepage
+    // Get tokens from www.facebook.com (desktop) since mbasic now returns SPA
     let fbDtsg = '';
     let jazoest = '';
-    try {
-      const tokenPage = await this.httpClient.request('https://mbasic.facebook.com/', {
-        referer: 'https://mbasic.facebook.com/',
-      });
-      const dtsgMatch = tokenPage.body.match(/name="fb_dtsg"\s+value="([^"]+)"/);
-      const jazoestMatch = tokenPage.body.match(/name="jazoest"\s+value="(\d+)"/);
-      fbDtsg = dtsgMatch ? dtsgMatch[1] : '';
-      jazoest = jazoestMatch ? jazoestMatch[1] : '';
-    } catch { /* ignore */ }
+    let lsd = '';
+    const tokenSources = [
+      'https://www.facebook.com/',
+      'https://www.facebook.com/messages/',
+      'https://mbasic.facebook.com/',
+    ];
+    for (const tokenUrl of tokenSources) {
+      if (fbDtsg) break;
+      try {
+        const tokenPage = await this.httpClient.request(tokenUrl, {
+          referer: 'https://www.facebook.com/',
+        });
+        const tokens = this.httpClient.extractTokens(tokenPage.body);
+        if (tokens.fbDtsg) {
+          fbDtsg = tokens.fbDtsg;
+          jazoest = tokens.jazoest;
+          lsd = tokens.lsd;
+          results.tokenSource = tokenUrl;
+        }
+      } catch { /* try next */ }
+    }
 
     if (fbDtsg) {
-      // 4a. Try /messaging/send/ endpoint (legacy desktop)
+      // 4a. Test direct POST to send endpoints
       const sendEndpoints = [
-        {
-          name: 'messaging-send',
-          url: 'https://www.facebook.com/messaging/send/',
-          referer: 'https://www.facebook.com/messages/',
-          body: new URLSearchParams({
-            fb_dtsg: fbDtsg,
-            jazoest,
-            body: '[DIAGNOSE TEST - NOT SENDING]',
-            'ids[0]': recipientId,
-            action_type: 'ma-type:user-generated-message',
-            has_attachment: 'false',
-            __a: '1',
-          }).toString(),
-        },
         {
           name: 'ajax-mercury',
           url: 'https://www.facebook.com/ajax/mercury/send_messages.php',
@@ -145,41 +146,47 @@ export class AutoMessage {
           body: new URLSearchParams({
             fb_dtsg: fbDtsg,
             jazoest,
+            lsd,
             'message_batch[0][action_type]': 'ma-type:user-generated-message',
-            'message_batch[0][body]': '[DIAGNOSE TEST - NOT SENDING]',
+            'message_batch[0][body]': 'Test von der Automatisierung',
             'message_batch[0][specific_to_list][0]': `fbid:${recipientId}`,
             'message_batch[0][specific_to_list][1]': `fbid:${myUserId}`,
             'message_batch[0][has_attachment]': 'false',
             'message_batch[0][source]': 'source:web',
-            __a: '1',
+            'message_batch[0][timestamp]': String(Date.now()),
+            'message_batch[0][message_id]': `${Date.now()}${Math.floor(Math.random() * 10000)}`,
+            '__a': '1',
           }).toString(),
         },
         {
-          name: 'mbasic-send',
-          url: 'https://mbasic.facebook.com/messages/send/',
-          referer: 'https://mbasic.facebook.com/messages/',
+          name: 'messaging-send',
+          url: 'https://www.facebook.com/messaging/send/',
+          referer: 'https://www.facebook.com/messages/',
           body: new URLSearchParams({
             fb_dtsg: fbDtsg,
             jazoest,
-            body: '[DIAGNOSE TEST - NOT SENDING]',
-            'ids[]': recipientId,
-            send: 'Senden',
+            lsd,
+            body: 'Test von der Automatisierung',
+            'ids[0]': recipientId,
+            action_type: 'ma-type:user-generated-message',
+            has_attachment: 'false',
+            timestamp: String(Date.now()),
+            __a: '1',
           }).toString(),
         },
       ];
 
       for (const ep of sendEndpoints) {
         try {
-          // Only do a GET probe (not POST) to check if endpoint exists
-          // We don't want to accidentally send a test message
-          const probe = await this.httpClient.request(ep.url, { referer: ep.referer });
+          const resp = await this.httpClient.post(ep.url, ep.body, { referer: ep.referer });
+          const cleanBody = resp.body.replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
           results[ep.name] = {
-            statusCode: probe.statusCode,
-            bodyLength: probe.body.length,
-            isLoginPage: this.httpClient.isLoginPage(probe.body),
-            isRedirect: probe.body.includes('window.location') || probe.statusCode === 302,
-            hasUnsupported: probe.body.includes('unsupported-interstitial'),
-            snippet: probe.body.substring(0, 300),
+            statusCode: resp.statusCode,
+            bodyLength: resp.body.length,
+            isLoginPage: this.httpClient.isLoginPage(resp.body),
+            snippet: cleanBody.substring(0, 500),
+            hasError: cleanBody.includes('"error"') || cleanBody.includes('"errorSummary"'),
+            hasPayload: cleanBody.includes('"payload"'),
           };
         } catch (error) {
           results[ep.name] = { error: error instanceof Error ? error.message : String(error) };
