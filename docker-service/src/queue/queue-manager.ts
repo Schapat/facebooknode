@@ -5,13 +5,11 @@ import type {
   ServiceConfig,
   GroupPostScraperInput,
   GroupMemberScraperInput,
-  AutoMessageInput,
 } from '@facebook-automation/shared-types';
 import { RedisClient } from '../infrastructure/redis';
 import { SessionManager } from '../services/session-manager';
 import { GroupPostScraper } from '../operations/group-post-scraper';
 import { GroupMemberScraper } from '../operations/group-member-scraper';
-import { AutoMessage } from '../operations/auto-message';
 import { createChildLogger } from '../utils/logger';
 
 const log = createChildLogger({ service: 'QueueManager' });
@@ -24,7 +22,6 @@ export class QueueManager {
   private queueEvents: QueueEvents;
   private postScraper: GroupPostScraper;
   private memberScraper: GroupMemberScraper;
-  private autoMessage: AutoMessage;
 
   constructor(
     private readonly redis: RedisClient,
@@ -38,7 +35,6 @@ export class QueueManager {
 
     this.postScraper = new GroupPostScraper(sessionManager);
     this.memberScraper = new GroupMemberScraper(sessionManager);
-    this.autoMessage = new AutoMessage(sessionManager);
   }
 
   async initialize(): Promise<void> {
@@ -81,8 +77,6 @@ export class QueueManager {
         return this.postScraper.execute(sessionName, input as GroupPostScraperInput);
       case 'scrape-members':
         return this.memberScraper.execute(sessionName, input as GroupMemberScraperInput);
-      case 'send-message':
-        return this.autoMessage.execute(sessionName, input as AutoMessageInput);
       default:
         throw new Error(`Unknown operation type: ${operationType}`);
     }

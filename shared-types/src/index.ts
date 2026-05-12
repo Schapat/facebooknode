@@ -59,11 +59,6 @@ export interface GroupMemberScraperInput {
   scrollTimeout?: number;
 }
 
-export interface AutoMessageInput {
-  username: string;
-  message: string;
-}
-
 // ---- Operation Outputs ----
 
 export interface GroupPost {
@@ -156,12 +151,12 @@ export type CookieFormat =
 
 // ---- Queue Types ----
 
-export type OperationType = 'scrape-posts' | 'scrape-members' | 'send-message';
+export type OperationType = 'scrape-posts' | 'scrape-members';
 
 export interface QueueJob {
   operationType: OperationType;
   sessionName: string;
-  input: GroupPostScraperInput | GroupMemberScraperInput | AutoMessageInput;
+  input: GroupPostScraperInput | GroupMemberScraperInput;
   priority?: number;
   delay?: number;
   retries?: number;

@@ -10,7 +10,6 @@ import type { SessionManager } from './services/session-manager';
 import type { QueueManager } from './queue/queue-manager';
 import { authMiddleware } from './middleware/auth';
 import { registerScrapeRoutes } from './routes/scrape';
-import { registerMessageRoutes } from './routes/message';
 import { registerSessionRoutes } from './routes/session';
 import { registerJobRoutes } from './routes/jobs';
 import { registerHealthRoutes } from './routes/health';
@@ -150,7 +149,6 @@ export async function createApp(deps: AppDependencies): Promise<FastifyInstance>
 
       registerSessionRoutes(protectedApp, deps.sessionManager);
       registerScrapeRoutes(protectedApp, deps.queueManager);
-      registerMessageRoutes(protectedApp, deps.queueManager, deps.sessionManager);
       registerJobRoutes(protectedApp, deps.queueManager);
     },
     { prefix: '/api' },

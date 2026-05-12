@@ -196,39 +196,6 @@ async function executeGroupMemberScraper(
   return response;
 }
 
-async function executeAutoMessage(
-  ctx: IExecuteFunctions,
-  apiUrl: string,
-  apiKey: string,
-  sessionName: string,
-  itemIndex: number,
-): Promise<unknown> {
-  const username = ctx.getNodeParameter('username', itemIndex) as string;
-  const message = ctx.getNodeParameter('message', itemIndex) as string;
-  const options = ctx.getNodeParameter('options', itemIndex, {}) as Record<string, unknown>;
-
-  const response = await ctx.helpers.request({
-    method: 'POST',
-    url: `${apiUrl}/api/message/send`,
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: {
-      sessionName,
-      username,
-      message,
-    },
-    json: true,
-  });
-
-  if (options.waitForCompletion !== false) {
-    return waitForJob(ctx, apiUrl, apiKey, response.jobId, options);
-  }
-
-  return response;
-}
-
 export class FacebookAutomation implements INodeType {
   description: INodeTypeDescription = {
     displayName: 'Facebook Automation',
@@ -267,12 +234,6 @@ export class FacebookAutomation implements INodeType {
             value: 'groupMemberScraper',
             description: 'Scrape members from Facebook groups',
             action: 'Scrape members from facebook groups',
-          },
-          {
-            name: 'Auto Message',
-            value: 'autoMessage',
-            description: 'Send a message to a Facebook user',
-            action: 'Send a message to a facebook user',
           },
         ],
         default: 'groupPostScraper',
@@ -323,27 +284,6 @@ export class FacebookAutomation implements INodeType {
         default: 200,
         description: 'Maximum number of members to scrape per group',
         displayOptions: { show: { operation: ['groupMemberScraper'] } },
-      },
-      {
-        displayName: 'Username or Profile URL',
-        name: 'username',
-        type: 'string',
-        default: '',
-        placeholder: 'https://www.facebook.com/john.doe or John Doe or 100001234567890',
-        description: 'Facebook profile URL (most reliable), display name, or numeric user ID',
-        required: true,
-        displayOptions: { show: { operation: ['autoMessage'] } },
-      },
-      {
-        displayName: 'Message',
-        name: 'message',
-        type: 'string',
-        typeOptions: { rows: 4 },
-        default: '',
-        placeholder: 'Hello! ...',
-        description: 'The message to send',
-        required: true,
-        displayOptions: { show: { operation: ['autoMessage'] } },
       },
       {
         displayName: 'Options',
@@ -411,9 +351,6 @@ export class FacebookAutomation implements INodeType {
             break;
           case 'groupMemberScraper':
             result = await executeGroupMemberScraper(this, apiUrl, apiKey, sessionName, i);
-            break;
-          case 'autoMessage':
-            result = await executeAutoMessage(this, apiUrl, apiKey, sessionName, i);
             break;
           default:
             throw new NodeOperationError(this.getNode(), `Unknown operation: ${operation}`);
