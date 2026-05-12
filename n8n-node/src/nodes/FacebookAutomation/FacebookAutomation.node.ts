@@ -259,11 +259,11 @@ export class FacebookAutomation implements INodeType {
         displayOptions: { show: { operation: ['groupPostScraper'] } },
       },
       {
-        displayName: 'Max Posts',
+        displayName: 'Max Posts Per Group',
         name: 'maxPosts',
         type: 'number',
         default: 50,
-        description: 'Maximum number of posts to scrape per group',
+        description: 'Maximum number of posts to scrape per group (each group is scraped individually up to this limit)',
         displayOptions: { show: { operation: ['groupPostScraper'] } },
       },
       {
