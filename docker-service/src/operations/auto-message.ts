@@ -235,22 +235,45 @@ export class AutoMessage {
       }
       results.versionId = versionId;
 
-      // Step 1: Search data-sjs blocks, ALL JS bundles, and messenger.com for version
+      // Step 1: Find LSVersion module + search data-sjs blocks + JS bundles
       try {
-        // Strategy A: Parse data-sjs script blocks (Facebook embeds config here)
+        // Strategy A: Search for LSVersion module definition in HTML
+        // Facebook defines modules with __d("LSVersion",[],function(a,b,c,d,e,f){e.exports="..."})
+        const lsVersionContexts: string[] = [];
+        let searchFrom = 0;
+        while (lsVersionContexts.length < 5) {
+          const idx = messengerBody.indexOf('LSVersion', searchFrom);
+          if (idx === -1) break;
+          const start = Math.max(0, idx - 30);
+          const end = Math.min(messengerBody.length, idx + 200);
+          lsVersionContexts.push(messengerBody.substring(start, end).replace(/[\n\r]/g, ' '));
+          searchFrom = idx + 9;
+        }
+        results.lsVersionContexts = lsVersionContexts;
+
+        // Also search for LSPlatformMessengerSyncParams (contains sync params module)
+        const syncParamIdx = messengerBody.indexOf('LSPlatformMessengerSyncParams');
+        if (syncParamIdx !== -1) {
+          results.syncParamsContext = messengerBody.substring(syncParamIdx, syncParamIdx + 300).replace(/[\n\r]/g, ' ');
+        }
+
+        // Strategy B: Parse data-sjs blocks - get the LS preloaded response (contains version)
         const sjsBlocks: string[] = [];
         const sjsPattern = /<script[^>]+data-sjs[^>]*>([\s\S]*?)<\/script>/gi;
         let sjsMatch;
         while ((sjsMatch = sjsPattern.exec(messengerBody)) !== null) {
           const block = sjsMatch[1];
-          // Only keep blocks that mention LS, lightspeed, version, or database
-          if (/lightspeed|LSPlatform|version_id|databaseVersion|schemaVersion|syncParams/i.test(block)) {
+          // Get the LS Lightspeed preloader result (this contains the initial sync data!)
+          if (block.includes('LSPlatformGraphQLLightspeedRequestQueryRelayPreloader')) {
+            // This block contains the preloaded sync response - get more of it
+            sjsBlocks.push(block.substring(0, 2000));
+          } else if (/LSVersion|lightspeed|syncParams/i.test(block)) {
             sjsBlocks.push(block.substring(0, 500));
           }
         }
         results.sjsLsBlocks = sjsBlocks;
 
-        // Strategy B: Search ALL JS bundles (not just first 3)
+        // Strategy C: Search ALL JS bundles for LSVersion module definition
         const scriptPattern2 = /<script[^>]+src="([^"]*rsrc\.php[^"]*)"[^>]*>/g;
         let sm2;
         const bundleUrls: string[] = [];
@@ -259,7 +282,7 @@ export class AutoMessage {
         }
         results.totalBundles = bundleUrls.length;
 
-        const bundleResults: Array<{idx: number; size: number; found: string | null; lsHits: string[]}> = [];
+        const bundleResults: Array<{idx: number; size: number; found: string | null; lsVersionHit: string | null}> = [];
         for (let i = 0; i < bundleUrls.length; i++) {
           const url = bundleUrls[i];
           try {
@@ -268,81 +291,51 @@ export class AutoMessage {
               referer: 'https://www.facebook.com/messages/',
             });
             let foundVersion: string | null = null;
+            let lsVersionHit: string | null = null;
 
-            // Quick check: does this bundle contain LS-related code?
-            const lsHits: string[] = [];
-            const lsTerms = ['version_id', 'schemaVersion', 'databaseVersion', 'LSPlatformDatabase', 'currentDatabaseVersion'];
-            for (const term of lsTerms) {
-              const termIdx = bundle.body.indexOf(term);
-              if (termIdx !== -1) {
-                lsHits.push(`${term}@${termIdx}: ${bundle.body.substring(termIdx, termIdx + 100).replace(/[\n\r]/g, '')}`);
+            // Primary: Search for LSVersion module definition
+            const lvIdx = bundle.body.indexOf('"LSVersion"');
+            if (lvIdx === -1) {
+              const lvIdx2 = bundle.body.indexOf("'LSVersion'");
+              if (lvIdx2 !== -1) {
+                lsVersionHit = bundle.body.substring(lvIdx2 - 20, lvIdx2 + 200).replace(/[\n\r]/g, ' ');
+              }
+            } else {
+              lsVersionHit = bundle.body.substring(Math.max(0, lvIdx - 20), lvIdx + 200).replace(/[\n\r]/g, ' ');
+            }
+
+            // Also try to extract the actual version number near LSVersion
+            if (lsVersionHit) {
+              const verMatch = lsVersionHit.match(/(\d{13,20})/);
+              if (verMatch) {
+                foundVersion = verMatch[1];
+                versionId = verMatch[1];
               }
             }
 
-            // Search for version patterns
-            const bundlePatterns = [
-              /LSPlatformDatabaseVersion[^;]*?["'](\d{13,20})["']/,
-              /databaseVersion['":\s]*(\d{13,20})/i,
-              /schemaVersion['":\s]*(\d{13,20})/i,
-              /version_id['":\s]*["']?(\d{13,20})["']?/,
-              /currentDatabaseVersion['":\s]*(\d{13,20})/i,
-            ];
-            for (const pat of bundlePatterns) {
-              const m = bundle.body.match(pat);
-              if (m) {
-                foundVersion = m[1];
-                versionId = m[1];
-                break;
+            // Fallback: regex patterns
+            if (!foundVersion) {
+              const bundlePatterns = [
+                /["']LSVersion["'][^}]*?["'](\d{13,20})["']/,
+                /exports\s*=\s*["'](\d{13,20})["']/,
+              ];
+              for (const pat of bundlePatterns) {
+                const m = bundle.body.match(pat);
+                if (m) {
+                  foundVersion = m[1];
+                  versionId = m[1];
+                  break;
+                }
               }
             }
 
-            // Only include bundles with LS hits or found version
-            if (lsHits.length > 0 || foundVersion) {
-              bundleResults.push({ idx: i, size: bundle.body.length, found: foundVersion, lsHits });
+            if (lsVersionHit || foundVersion) {
+              bundleResults.push({ idx: i, size: bundle.body.length, found: foundVersion, lsVersionHit });
             }
             if (foundVersion) break;
           } catch { /* skip failed bundles */ }
         }
         results.bundleSearch = bundleResults;
-
-        // Strategy C: Try messenger.com for the version
-        if (versionId === '0') {
-          try {
-            const messengerCom = await this.httpClient.request('https://www.messenger.com/', {
-              referer: 'https://www.messenger.com/',
-            });
-            // Search for version patterns
-            const mcPatterns = [
-              /["']schemaVersion["']\s*:\s*["']?(\d{13,20})["']?/i,
-              /["']version_id["']\s*:\s*["'](\d{13,20})["']/i,
-              /databaseVersion['":\s]*(\d{13,20})/i,
-              /currentDatabaseVersion['":\s]*(\d{13,20})/i,
-            ];
-            for (const pat of mcPatterns) {
-              const m = messengerCom.body.match(pat);
-              if (m) {
-                versionId = m[1];
-                results.versionFromMessengerCom = versionId;
-                break;
-              }
-            }
-            // Also look for the same string context search
-            const mcTerms = ['version_id', 'schemaVersion', 'databaseVersion', 'LSVersion'];
-            const mcContexts: Record<string, string> = {};
-            for (const term of mcTerms) {
-              const idx = messengerCom.body.indexOf(term);
-              if (idx !== -1) {
-                mcContexts[term] = messengerCom.body.substring(idx, idx + 120).replace(/[\n\r]/g, ' ');
-              }
-            }
-            if (Object.keys(mcContexts).length > 0) {
-              results.messengerComContexts = mcContexts;
-            }
-            results.messengerComPageLength = messengerCom.body.length;
-          } catch (error) {
-            results.messengerComError = error instanceof Error ? error.message : String(error);
-          }
-        }
       } catch (error) {
         results.bundleSearchError = error instanceof Error ? error.message : String(error);
       }
